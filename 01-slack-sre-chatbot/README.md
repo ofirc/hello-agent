@@ -20,7 +20,8 @@ between environments, and opens pull requests to fix it.
 ```
 
 Architecture: Slack over Socket Mode into an always-on agent on a Cloud Run instance,
-fanning out to Grafana, JIRA, GitHub and Argo CD over REST. Nothing listens. Secrets come
+fanning out to Grafana, JIRA, GitHub and Argo CD over REST. No inbound control path:
+the only listener is a health endpoint Cloud Run requires. Secrets come
 from Secret Manager, identity from the attached service account.
 
 ```
@@ -439,19 +440,92 @@ cert-manager with an internal CA, and that is out of scope for a workshop.
 Before containerising anything, check the whole chain works. Socket Mode means no
 tunnel, no ngrok, no public URL.
 
+**Use two terminals.** Backgrounding the port-forward with `&` looks tidier and will
+bite you: it dies with the shell, or silently loses its connection, and every Argo CD
+call then fails in a way that reads like a bad token. Keep it in the foreground where
+you can see it.
+
 ```bash
-cd ..
-kubectl port-forward -n argocd svc/argocd-server 8080:443 &
+# Terminal A - the tunnel to Argo CD. Leave it running.
+pkill -f 'port-forward.*argocd-server'        # clear any zombie holding port 8080
+kubectl port-forward -n argocd svc/argocd-server 8080:443
+```
+
+```bash
+# Terminal B - the agent
+cd 01-slack-sre-chatbot
 set -a && source .env && set +a
 ARGOCD_BASE_URL=https://localhost:8080 go run ./cmd/agent
 ```
 
+The `ARGOCD_BASE_URL` override is load-bearing. `.env` holds the internal load balancer
+address from step 5, which your laptop cannot route to.
+
+Wait for this line before touching Slack:
+
 ```json
-{"msg":"connected to slack with socket mode","bot":"sre-agent","team":"Harness Engineering"}
+{"msg":"starting","bot":"sre-agent","team":"Harness Engineering","envs":"test,stage,prod",
+ "github":true,"argocd":true,"grafana":false,"jira":false,"vertex":false}
+{"msg":"connected to slack with socket mode"}
 ```
 
-Then in Slack, `/sre doctor`. The override matters: `.env` holds the internal load
-balancer address from step 5, which your laptop cannot route to.
+`github:true` and `argocd:true` are the two that matter. The other three are optional and
+the agent degrades cleanly without them.
+
+### Where to type the commands
+
+**Use a channel, not the app's DM, and never your own self-DM.**
+
+| Where | Works? | Why |
+| --- | --- | --- |
+| A channel such as `#all-harness-engineering` | yes | the bot has `chat:write.public`, so it can post without being invited |
+| DM with `sre-agent` | only after enabling the messages tab | Slack shows *"Sending messages to this app has been turned off"* unless the manifest declares `app_home.messages_tab_enabled` |
+| Your own self-DM (*"Ofir Cohen (you)"*) | **no** | the bot is not a participant and cannot post there |
+
+The self-DM failure is the confusing one, because the command *does* reach the agent and
+run. Only the reply fails, so Slack looks silent while the log shows:
+
+```json
+{"level":"ERROR","msg":"cannot post anchor message","err":"channel_not_found","channel":"D0..."}
+```
+
+If you see that, you are typing in the wrong conversation. Nothing is wrong with the agent.
+
+### Try it
+
+```
+/sre doctor
+```
+
+![/sre doctor output](docs/images/sre-doctor.png)
+
+Confirms which integrations came up. This is the first thing to run after any change,
+and the fastest way to tell a configuration problem from a code problem.
+
+```
+/sre drift list
+```
+
+![/sre drift list output](docs/images/sre-drift-list.png)
+
+One finding: prod is on `v1.1.0` while stage already has `v1.2.0`.
+
+```
+/sre drift debug product-catalog
+```
+
+![/sre drift debug output](docs/images/sre-drift-debug.png)
+
+Three things in that output are worth pointing at during a demo:
+
+- **"Nothing failed. The release was simply never promoted"** — the engine classified
+  this as a `promotion-gap`, not a `version-skew`. Both environments match their own
+  overlay; the overlays disagree with each other.
+- **The suggested fix goes forward**, `v1.1.0 -> v1.2.0`. For a failed sync it would go
+  *backwards* instead, pinning git to the version actually running.
+- **"User impact unknown, Grafana is not wired up"** — it says so rather than omitting
+  the question or inventing a number. With `VERTEX_PROJECT` empty, that whole narrative
+  is `deterministicNarrative`, with no model in the loop.
 
 <details>
 <summary><b>What the code is, and the three decisions worth defending</b></summary>
@@ -554,8 +628,11 @@ always-on, stateful agent. A Cloud Run *service* scales to zero and is driven by
 requests, which is exactly wrong for a process that holds a WebSocket open and keeps
 state between turns.
 
-- `--ingress=internal` because nothing should be able to reach this instance. The agent
-  only dials out, so accepting inbound traffic would be pure attack surface.
+- `--ingress=internal` plus `--port=8080`. The port is not optional: Cloud Run rejects
+  the create with *"Ingress settings require a single container with a port"*. The agent
+  is otherwise outbound-only, so that listener serves nothing but `/healthz` and is
+  unreachable from the internet. No Slack traffic arrives inbound either way, commands
+  come down the outbound WebSocket.
 - `--network` / `--subnet` give Direct VPC egress, which is the only reason the agent can
   reach the Argo CD internal load balancer.
 - `--set-secrets` keeps tokens out of the image and out of `describe` output. The

@@ -30,6 +30,14 @@ display_information:
     It connects over Socket Mode, so it exposes no inbound endpoint.
 
 features:
+  # Without this block Slack disables the DM composer and shows "Sending messages to
+  # this app has been turned off" in the app's Direct Message. Slash commands still
+  # work in channels, so the symptom looks like the bot is broken only in DMs.
+  app_home:
+    home_tab_enabled: false
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
+
   bot_user:
     display_name: sre-agent
     # Honest: the agent really is always on, it runs as a Cloud Run instance rather

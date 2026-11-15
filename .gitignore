@@ -28,9 +28,13 @@ service-account*.json
 
 # Screenshots and scratch images. Captured while working, not part of the repo, and
 # they routinely contain tokens and project identifiers in the frame.
+#
+# Documentation images are the exception: they live in docs/images/ under a deliberate
+# name, which forces a rename and therefore a moment's thought about what is in frame.
 Screenshot*.png
 Screenshot*.jpg
 Screen?Shot*.png
+!**/docs/images/**
 
 # Go
 /bin/

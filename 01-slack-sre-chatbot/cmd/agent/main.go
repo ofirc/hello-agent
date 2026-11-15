@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -94,6 +95,16 @@ func run(log *slog.Logger) error {
 		"github", enabled["github"], "argocd", enabled["argocd"],
 		"grafana", enabled["grafana"], "jira", enabled["jira"], "vertex", enabled["vertex"],
 	)
+
+	// Cloud Run instances require a container that listens on a port once --ingress is
+	// configured; the create fails with "Ingress settings require a single container
+	// with a port". This agent is otherwise outbound-only, so the listener exists purely
+	// to satisfy that contract and serves nothing but health.
+	//
+	// It is not an inbound control path. The instance runs with --ingress=internal and
+	// the invoker IAM check on, so the port is unreachable from the internet, and no
+	// Slack traffic ever arrives this way: commands come down the outbound WebSocket.
+	go serveHealth(ctx, log)
 
 	client := socketmode.New(api)
 	go handleEvents(ctx, client, router, log)
@@ -182,6 +193,39 @@ func handleEvents(ctx context.Context, client *socketmode.Client, router *comman
 				}
 			}
 		}
+	}
+}
+
+// serveHealth runs the liveness endpoint Cloud Run needs. Deliberately tiny: no
+// routing, no business logic, nothing that could become an accidental control plane.
+func serveHealth(ctx context.Context, log *slog.Logger) {
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok\n"))
+	})
+
+	srv := &http.Server{
+		Addr:              ":" + port,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
+	}()
+
+	log.Info("health endpoint listening", "port", port)
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Error("health endpoint failed", "err", err)
 	}
 }
 

@@ -27,5 +27,8 @@ COPY --from=build /out/agent /agent
 # Numeric, not `nonroot`: Kubernetes runAsNonRoot cannot verify a username.
 USER 65532:65532
 
-# Socket Mode dials out. Nothing listens, so there is no EXPOSE and no port to publish.
+# Socket Mode dials out: no Slack traffic ever arrives inbound. The only listener is a
+# health endpoint, which exists because Cloud Run instances refuse to start with
+# --ingress configured and no serving port.
+EXPOSE 8080
 ENTRYPOINT ["/agent"]
