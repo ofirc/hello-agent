@@ -2,12 +2,18 @@
 # Step 3 of 4: register the Argo CD applications, expose the API inside the VPC, and
 # mint the agent's own Argo CD token.
 #
-# This used to be a wall of kubectl patches and argocd CLI commands printed for you to
-# copy. It is a script now because it is the step that hands the next step its inputs,
-# and a handoff that depends on a human pasting four commands correctly is the reason
-# ./04-agent.sh used to fail on a missing ARGOCD_TOKEN.
+# Safe to re-run. Every phase checks before acting, so this is also the command for
+# "I edited an Application manifest, make the cluster match":
 #
-# It appends ARGOCD_BASE_URL and ARGOCD_TOKEN to ../.env, so 04-agent.sh just works.
+#   ./03-argocd.sh                 converge everything, skipping what is already done
+#   ./03-argocd.sh --apps-only     re-apply the Applications and stop (seconds)
+#   ./03-argocd.sh --rotate-token  force a fresh Argo CD token even if the old one works
+#
+# Why --apps-only exists. Argo CD reads the *overlays* from GitHub but the
+# *Applications* from the cluster. Only the first of those changes when you push, so
+# editing an Application manifest and pushing does nothing until it is re-applied.
+# That gap once left a stale kustomize image override running against a repo that no
+# longer had one, which silently deployed :latest to every environment.
 #
 # No argocd CLI needed: everything here is kubectl plus the Argo CD REST API.
 set -euo pipefail
@@ -20,6 +26,16 @@ ACCOUNT="sre-agent"
 PF_PORT=18080
 PF_PID=""
 
+APPS_ONLY=false
+ROTATE_TOKEN=false
+for arg in "$@"; do
+  case "$arg" in
+    --apps-only)    APPS_ONLY=true ;;
+    --rotate-token) ROTATE_TOKEN=true ;;
+    *) echo "Unknown flag: $arg" >&2; exit 2 ;;
+  esac
+done
+
 cleanup() { [[ -n "$PF_PID" ]] && kill "$PF_PID" 2>/dev/null || true; }
 trap cleanup EXIT
 
@@ -28,83 +44,163 @@ if ! kubectl get ns argocd >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "==> Registering the Argo CD applications"
-kubectl apply -f ./argocd/
-
-# The agent runs on Cloud Run, outside the cluster, so it needs a routable address for
-# the Argo CD API. An internal load balancer keeps that address on the VPC: reachable
-# from the Cloud Run instance via Direct VPC egress, unreachable from the internet.
-echo "==> Exposing argocd-server on an internal load balancer"
-kubectl annotate svc argocd-server -n argocd \
-  networking.gke.io/load-balancer-type=Internal --overwrite
-kubectl patch svc argocd-server -n argocd -p '{"spec":{"type":"LoadBalancer"}}'
-
-echo "==> Waiting for the load balancer address (up to 3 minutes)"
-ARGOCD_IP=""
-for _ in $(seq 1 36); do
-  ARGOCD_IP="$(kubectl get svc argocd-server -n argocd \
-    -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)"
-  [[ -n "$ARGOCD_IP" ]] && break
-  sleep 5
-done
-if [[ -z "$ARGOCD_IP" ]]; then
-  echo "No load balancer IP yet. Check: kubectl get svc argocd-server -n argocd" >&2
+# Guard the context. These projects routinely hold other people's clusters, and
+# kubectl acts on whatever context is current rather than on $CLUSTER.
+ctx="$(kubectl config current-context 2>/dev/null || true)"
+if [[ "$ctx" != *"${CLUSTER}"* ]]; then
+  echo "kubectl context is '${ctx}', not ${CLUSTER}. Refusing to act." >&2
+  echo "  gcloud container clusters get-credentials ${CLUSTER} \\" >&2
+  echo "    --project=${PROJECT} --region=${REGION} --dns-endpoint" >&2
   exit 1
 fi
-echo "    https://${ARGOCD_IP}"
 
-# Create a dedicated account rather than reusing admin. The agent's actions are then
-# attributable in the Argo CD audit log and its token is revocable on its own.
-echo "==> Creating the ${ACCOUNT} account, scoped to get and sync"
-kubectl patch configmap argocd-cm -n argocd --type merge \
-  -p "{\"data\":{\"accounts.${ACCOUNT}\":\"apiKey\"}}"
-kubectl patch configmap argocd-rbac-cm -n argocd --type merge -p "$(cat <<JSON
+# ---------------------------------------------------------------------------
+# Applications. Always applied: kubectl apply is idempotent by nature, it is the cheap
+# part, and it is the entire point of --apps-only.
+# ---------------------------------------------------------------------------
+echo "==> Applying Argo CD applications"
+kubectl apply -f ./argocd/
+
+if [[ "$APPS_ONLY" == true ]]; then
+  echo
+  kubectl get applications -n argocd
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Internal load balancer for the Argo CD API, so the Cloud Run agent can reach it over
+# Direct VPC egress without the API being on the internet.
+# ---------------------------------------------------------------------------
+svc_type="$(kubectl get svc argocd-server -n argocd -o jsonpath='{.spec.type}' 2>/dev/null || true)"
+lb_kind="$(kubectl get svc argocd-server -n argocd \
+  -o jsonpath='{.metadata.annotations.networking\.gke\.io/load-balancer-type}' 2>/dev/null || true)"
+ARGOCD_IP="$(kubectl get svc argocd-server -n argocd \
+  -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)"
+
+if [[ "$svc_type" == "LoadBalancer" && "$lb_kind" == "Internal" && -n "$ARGOCD_IP" ]]; then
+  echo "==> Internal load balancer already present (${ARGOCD_IP}), skipping"
+else
+  echo "==> Exposing argocd-server on an internal load balancer"
+  kubectl annotate svc argocd-server -n argocd \
+    networking.gke.io/load-balancer-type=Internal --overwrite
+  kubectl patch svc argocd-server -n argocd -p '{"spec":{"type":"LoadBalancer"}}'
+
+  echo "==> Waiting for the load balancer address (up to 3 minutes)"
+  ARGOCD_IP=""
+  for _ in $(seq 1 36); do
+    ARGOCD_IP="$(kubectl get svc argocd-server -n argocd \
+      -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)"
+    [[ -n "$ARGOCD_IP" ]] && break
+    sleep 5
+  done
+  if [[ -z "$ARGOCD_IP" ]]; then
+    echo "No load balancer IP yet. Check: kubectl get svc argocd-server -n argocd" >&2
+    exit 1
+  fi
+  echo "    https://${ARGOCD_IP}"
+fi
+
+# ---------------------------------------------------------------------------
+# A dedicated Argo CD account, so the agent's actions are attributable in the audit
+# log and its token is revocable without touching admin.
+# ---------------------------------------------------------------------------
+have_account="$(kubectl get cm argocd-cm -n argocd \
+  -o jsonpath="{.data.accounts\.${ACCOUNT}}" 2>/dev/null || true)"
+have_rbac="$(kubectl get cm argocd-rbac-cm -n argocd \
+  -o jsonpath='{.data.policy\.csv}' 2>/dev/null | grep -c "role:${ACCOUNT}" || true)"
+
+if [[ "$have_account" == "apiKey" && "$have_rbac" != "0" ]]; then
+  echo "==> Account ${ACCOUNT} already configured, skipping"
+  ACCOUNT_CHANGED=false
+else
+  echo "==> Creating the ${ACCOUNT} account, scoped to get and sync"
+  kubectl patch configmap argocd-cm -n argocd --type merge \
+    -p "{\"data\":{\"accounts.${ACCOUNT}\":\"apiKey\"}}"
+  kubectl patch configmap argocd-rbac-cm -n argocd --type merge -p "$(cat <<JSON
 {"data":{"policy.csv":"p, role:${ACCOUNT}, applications, get, */*, allow\np, role:${ACCOUNT}, applications, sync, */*, allow\ng, ${ACCOUNT}, role:${ACCOUNT}\n"}}
 JSON
 )"
+  ACCOUNT_CHANGED=true
+fi
 
-# argocd-server caches the configmaps, so it has to be restarted before it will issue a
-# token for an account it has not seen.
-echo "==> Restarting argocd-server to pick up the new account"
-kubectl rollout restart deployment/argocd-server -n argocd
-kubectl rollout status  deployment/argocd-server -n argocd --timeout=5m
+# argocd-server caches those configmaps, so it only needs restarting when they
+# actually changed. Restarting unconditionally would drop the API for a minute on
+# every re-run, which is exactly what makes a script feel unsafe to repeat.
+if [[ "$ACCOUNT_CHANGED" == true ]]; then
+  echo "==> Restarting argocd-server to pick up the new account"
+  kubectl rollout restart deployment/argocd-server -n argocd
+  kubectl rollout status  deployment/argocd-server -n argocd --timeout=5m
+fi
 
-echo "==> Port-forwarding to mint the token"
-kubectl port-forward -n argocd svc/argocd-server "${PF_PORT}:443" >/dev/null 2>&1 &
-PF_PID=$!
-for _ in $(seq 1 20); do
-  curl -sk "https://localhost:${PF_PORT}/api/version" >/dev/null 2>&1 && break
-  sleep 1
-done
-
-ADMIN_PASSWORD="$(kubectl -n argocd get secret argocd-initial-admin-secret \
-  -o jsonpath='{.data.password}' | base64 -d)"
-
-api() { # api <method> <path> <json-body>
-  curl -sk -X "$1" "https://localhost:${PF_PORT}$2" \
-    -H "Content-Type: application/json" \
-    ${ADMIN_JWT:+-H "Authorization: Bearer ${ADMIN_JWT}"} \
-    -d "$3"
+start_port_forward() {
+  [[ -n "$PF_PID" ]] && return 0
+  kubectl port-forward -n argocd svc/argocd-server "${PF_PORT}:443" >/dev/null 2>&1 &
+  PF_PID=$!
+  for _ in $(seq 1 20); do
+    curl -sk "https://localhost:${PF_PORT}/api/version" >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  echo "Could not reach argocd-server through the port-forward." >&2
+  return 1
 }
 
-jsonfield() { python3 -c 'import json,sys; print(json.load(sys.stdin).get(sys.argv[1],""))' "$1"; }
+existing_token() {
+  [[ -f "$ENV_FILE" ]] || return 1
+  grep -E '^ARGOCD_TOKEN=.+' "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2-
+}
 
-ADMIN_JWT=""
-ADMIN_JWT="$(api POST /api/v1/session \
-  "{\"username\":\"admin\",\"password\":\"${ADMIN_PASSWORD}\"}" | jsonfield token)"
-if [[ -z "$ADMIN_JWT" ]]; then
-  echo "Could not log in to Argo CD as admin." >&2
-  exit 1
+# A token counts as "already fine" only if Argo CD still accepts it. Rebuilding the
+# cluster leaves a perfectly well-formed token in .env that no longer authenticates,
+# so ask the API rather than testing for a non-empty string.
+token_works() {
+  local t="$1" code
+  [[ -n "$t" ]] || return 1
+  code="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 \
+    -H "Authorization: Bearer ${t}" \
+    "https://localhost:${PF_PORT}/api/v1/applications" 2>/dev/null || echo 000)"
+  [[ "$code" == "200" ]]
+}
+
+AGENT_TOKEN=""
+start_port_forward
+
+if [[ "$ROTATE_TOKEN" != true ]]; then
+  candidate="$(existing_token || true)"
+  if token_works "$candidate"; then
+    echo "==> Existing ARGOCD_TOKEN still valid, keeping it"
+    AGENT_TOKEN="$candidate"
+  elif [[ -n "$candidate" ]]; then
+    echo "==> Existing ARGOCD_TOKEN no longer accepted, minting a new one"
+  fi
 fi
 
-AGENT_TOKEN="$(api POST "/api/v1/account/${ACCOUNT}/token" '{}' | jsonfield token)"
 if [[ -z "$AGENT_TOKEN" ]]; then
-  echo "Could not mint a token for ${ACCOUNT}. Is accounts.${ACCOUNT} set in argocd-cm?" >&2
-  exit 1
+  echo "==> Minting a token for ${ACCOUNT}"
+  ADMIN_PASSWORD="$(kubectl -n argocd get secret argocd-initial-admin-secret \
+    -o jsonpath='{.data.password}' | base64 -d)"
+
+  jsonfield() { python3 -c 'import json,sys; print(json.load(sys.stdin).get(sys.argv[1],""))' "$1"; }
+
+  ADMIN_JWT="$(curl -sk -X POST "https://localhost:${PF_PORT}/api/v1/session" \
+    -H "Content-Type: application/json" \
+    -d "{\"username\":\"admin\",\"password\":\"${ADMIN_PASSWORD}\"}" | jsonfield token)"
+  if [[ -z "$ADMIN_JWT" ]]; then
+    echo "Could not log in to Argo CD as admin." >&2
+    exit 1
+  fi
+
+  AGENT_TOKEN="$(curl -sk -X POST "https://localhost:${PF_PORT}/api/v1/account/${ACCOUNT}/token" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer ${ADMIN_JWT}" \
+    -d '{}' | jsonfield token)"
+  if [[ -z "$AGENT_TOKEN" ]]; then
+    echo "Could not mint a token for ${ACCOUNT}." >&2
+    exit 1
+  fi
 fi
 
-# Replace rather than append, so rerunning this script does not leave a stale token
-# earlier in the file shadowing the fresh one further down.
+# Replace in place rather than append, so repeated runs cannot leave a stale value
+# earlier in the file shadowing the fresh one.
 echo "==> Writing ARGOCD_* into ${ENV_FILE}"
 [[ -f "$ENV_FILE" ]] || cp ../.env.example "$ENV_FILE"
 python3 - "$ENV_FILE" "https://${ARGOCD_IP}" "$AGENT_TOKEN" <<'PY'
@@ -125,9 +221,9 @@ cat <<EOF
 Argo CD is wired up.
 
   ARGOCD_BASE_URL  https://${ARGOCD_IP}   (private, VPC only)
-  ARGOCD_TOKEN     written to .env        (account: ${ACCOUNT}, get + sync only)
+  ARGOCD_TOKEN     in .env                (account: ${ACCOUNT}, get + sync only)
 
-That address is not reachable from your laptop. To use the agent locally, port-forward
+That address is not reachable from your laptop. To run the agent locally, port-forward
 and point it at localhost instead:
 
   kubectl port-forward -n argocd svc/argocd-server 8080:443 &
@@ -137,6 +233,10 @@ The Argo CD UI, same forward, user admin:
 
   kubectl -n argocd get secret argocd-initial-admin-secret \\
     -o jsonpath='{.data.password}' | base64 -d
+
+After editing an Application manifest, this is the cheap way to make the cluster match:
+
+  ./03-argocd.sh --apps-only
 
 Next: ./04-agent.sh
 EOF

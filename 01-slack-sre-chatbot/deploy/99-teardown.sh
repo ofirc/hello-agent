@@ -129,6 +129,20 @@ echo
 # ---------------------------------------------------------------------------
 if [[ "$exists_cluster" == true ]]; then
   echo "==> Removing the Argo CD load balancer before the cluster"
+
+  # Guard the kubectl context. These projects routinely hold other people's clusters,
+  # and kubectl acts on whatever context happens to be current, not on $CLUSTER. The
+  # next command deletes a Service in the argocd namespace, which would be a genuinely
+  # bad thing to run against someone else's cluster.
+  ctx="$(kubectl config current-context 2>/dev/null || true)"
+  if [[ "$ctx" != *"${CLUSTER}"* ]]; then
+    echo "    kubectl context is '${ctx}', which is not ${CLUSTER}." >&2
+    echo "    Refusing to delete Services. Point kubectl at the right cluster with:" >&2
+    echo "      gcloud container clusters get-credentials ${CLUSTER} \\" >&2
+    echo "        --project=${PROJECT} --region=${REGION} --dns-endpoint" >&2
+    exit 1
+  fi
+
   if kubectl get svc argocd-server -n argocd >/dev/null 2>&1; then
     kubectl delete svc argocd-server -n argocd --wait=true --timeout=5m || true
     # The forwarding rule is torn down asynchronously, so give the controller a moment

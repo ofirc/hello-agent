@@ -72,9 +72,27 @@ EOF
   exit 1
 fi
 
+# Private nodes are not a private cluster. The control plane keeps a public IP endpoint
+# unless you say otherwise, and it answers from anywhere on the internet with a 401:
+# reachable, with authentication the only thing in front of it.
+#
+# The fix here is the DNS-based endpoint. Access is gated by IAM rather than by source
+# IP, so there is no allowlist to maintain and no open IP endpoint to find.
+#
+# Do NOT reach for --enable-master-authorized-networks instead. This cluster also has
+# privateEndpointEnforcementEnabled set, and turning on authorized networks activates
+# it: the allowlist then applies to the *private* endpoint and the public one stops
+# serving entirely. You get locked out of your own cluster, and the symptom is a TCP
+# timeout that looks like the control plane is down rather than a permissions error.
+echo "==> Enabling the DNS-based control plane endpoint (IAM-gated, no public IP)"
+gcloud container clusters update "$CLUSTER" \
+  --project="$PROJECT" --region="$REGION" \
+  --enable-dns-access >/dev/null
+
 echo "==> Fetching credentials"
 gcloud container clusters get-credentials "$CLUSTER" \
-  --project="$PROJECT" --region="$REGION"
+  --project="$PROJECT" --region="$REGION" \
+  --dns-endpoint
 
 echo "==> Installing Argo CD"
 kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f -

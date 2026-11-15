@@ -26,20 +26,37 @@ command -v docker >/dev/null 2>&1 || { echo "docker is not installed" >&2; exit 
 docker info >/dev/null 2>&1 || { echo "the docker daemon is not running" >&2; exit 1; }
 
 echo "==> Logging in to ghcr.io as ${GHCR_OWNER}"
-# Reuse the gh CLI token so there is no second credential to manage. It needs the
-# write:packages scope.
-if ! gh auth token 2>/dev/null | docker login ghcr.io -u "$GHCR_OWNER" --password-stdin >/dev/null 2>&1; then
+# Pin the token to GHCR_OWNER with -u rather than taking whichever account happens to
+# be active. With two accounts in the keyring, `gh auth switch` elsewhere silently
+# redirects this, and the failure surfaces much later as
+#
+#   error from registry: permission_denied: The token provided does not match
+#   expected scopes
+#
+# which reads like a missing scope rather than the wrong account.
+GH_TOKEN_VALUE="$(gh auth token -h github.com -u "$GHCR_OWNER" 2>/dev/null || true)"
+if [[ -z "$GH_TOKEN_VALUE" ]]; then
+  echo "No gh token for account '${GHCR_OWNER}'. Log in with: gh auth login" >&2
+  exit 1
+fi
+
+# Fail here, with a precise message, rather than 90 seconds into a push.
+SCOPES="$(curl -sI -H "Authorization: Bearer ${GH_TOKEN_VALUE}" https://api.github.com/user \
+          | tr -d '\r' | awk -F': ' 'tolower($1)=="x-oauth-scopes"{print $2}')"
+if [[ "$SCOPES" != *"write:packages"* ]]; then
   cat >&2 <<EOF
-Could not log in to ghcr.io.
+The gh token for '${GHCR_OWNER}' cannot push to GHCR.
 
-Most likely the gh token lacks the write:packages scope:
+  scopes: ${SCOPES:-<none>}
+  needed: write:packages
 
-  gh auth refresh -h github.com -s write:packages
-
-Also confirm the active account is ${GHCR_OWNER}:
-
-  gh auth status
+  gh auth refresh -h github.com -u ${GHCR_OWNER} -s write:packages
 EOF
+  exit 1
+fi
+
+if ! printf '%s' "$GH_TOKEN_VALUE" | docker login ghcr.io -u "$GHCR_OWNER" --password-stdin >/dev/null 2>&1; then
+  echo "docker login to ghcr.io failed for ${GHCR_OWNER}" >&2
   exit 1
 fi
 
