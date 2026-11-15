@@ -15,15 +15,6 @@ spec:
     repoURL: https://github.com/ofirc/hello-agent.git
     targetRevision: main
     path: 01-slack-sre-chatbot/gitops/overlays/prod
-    # The registry lives here, not in the overlay, so the GitOps repo carries no
-    # project id. 03-argocd.sh substitutes IMAGE_REPO at apply time.
-    #
-    # Only the image *name* is overridden. The tag still comes from the overlay's
-    # newTag, which is the single line /sre drift fix edits and the single value the
-    # agent compares against the cluster.
-    kustomize:
-      images:
-        - product-catalog=IMAGE_REPO/product-catalog
   destination:
     server: https://kubernetes.default.svc
     namespace: prod

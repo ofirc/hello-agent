@@ -29,12 +29,15 @@ patches:
 
 # The SRE agent edits exactly one line in this file: the newTag below.
 #
-# There is deliberately no registry here. The image name is set by the Argo CD
-# Application (spec.source.kustomize.images), so this repo carries no project id and
-# the same overlays work in anyone's account. This file holds the version and nothing
-# else, which is exactly what /sre drift fix needs to change.
+# The image is on GHCR rather than Artifact Registry so this file, which Argo CD reads
+# straight from GitHub, carries no cloud project id.
+#
+# The registry cannot live in the Argo CD Application instead. An override there
+# replaces this whole images entry rather than merging with it, which drops newTag and
+# silently deploys :latest.
 images:
   - name: product-catalog
+    newName: ghcr.io/ofirc/product-catalog
     newTag: v1.2.0
 
 # APP_VERSION is derived from the image tag rather than duplicated, so there is exactly

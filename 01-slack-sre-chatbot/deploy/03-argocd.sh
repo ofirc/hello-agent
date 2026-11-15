@@ -28,22 +28,8 @@ if ! kubectl get ns argocd >/dev/null 2>&1; then
   exit 1
 fi
 
-# The committed Application manifests carry an IMAGE_REPO placeholder so the repo holds
-# no project id. Substitute it into a temp copy and apply that, leaving the working
-# tree clean and nothing project-specific ever committed.
-echo "==> Registering the Argo CD applications (image repo: ${AR_PATH})"
-RENDERED="$(mktemp -d)"
-trap 'rm -rf "$RENDERED"; cleanup' EXIT
-for f in ./argocd/*.yaml; do
-  perl -pe "s{IMAGE_REPO}{${AR_PATH}}g" "$f" > "${RENDERED}/$(basename "$f")"
-done
-
-if grep -rq "IMAGE_REPO" "$RENDERED"; then
-  echo "IMAGE_REPO placeholder survived substitution, refusing to apply." >&2
-  exit 1
-fi
-
-kubectl apply -f "$RENDERED"
+echo "==> Registering the Argo CD applications"
+kubectl apply -f ./argocd/
 
 # The agent runs on Cloud Run, outside the cluster, so it needs a routable address for
 # the Argo CD API. An internal load balancer keeps that address on the VPC: reachable

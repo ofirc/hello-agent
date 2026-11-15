@@ -65,8 +65,14 @@ Each script prints the next one to run and refuses to start if a previous step h
 happened. `03-argocd.sh` writes `ARGOCD_BASE_URL` and `ARGOCD_TOKEN` into `.env`, so
 `04-agent.sh` picks them up with nothing to copy by hand.
 
-**Prerequisites:** `gcloud` (with `beta` and `alpha`), `kubectl`, `go` 1.26+, `python3`,
-`curl`. No local Docker, no `argocd` CLI, no ngrok.
+**Prerequisites:** `gcloud` (with `beta` and `alpha`), `kubectl`, `docker`, `gh`,
+`go` 1.26+, `python3`, `curl`. No `argocd` CLI and no ngrok.
+
+`gh` needs the `write:packages` scope for the GHCR push in step 4:
+
+```bash
+gh auth refresh -h github.com -s write:packages
+```
 
 ---
 
@@ -233,37 +239,271 @@ three tiny Deployments. Scaling is not the point of this demo.
 
 ## 4. Build the production stack
 
+One-time setup. The `gh` token needs the `write:packages` scope to push to GHCR, and it
+is not included by default:
+
+```bash
+gh auth refresh -h github.com -s write:packages
+gh auth status                      # confirm the active account is ofirc
+docker info >/dev/null && echo "docker ok"
+```
+
+Then:
+
 ```bash
 ./02-stack.sh
 ```
 
-Builds `product-catalog` twice, as `v1.1.0` and `v1.2.0`, with Cloud Build. No local
-Docker. Same source both times; only the baked-in `APP_VERSION` differs, and the
-`?filter=` feature is gated on it.
+Builds `product-catalog` twice, as `v1.1.0` and `v1.2.0`, and pushes both to
+`ghcr.io/<owner>/product-catalog`. Same source both times; only the baked-in
+`APP_VERSION` differs, and the `?filter=` feature is gated on it. The script reuses the
+`gh` token for `docker login`, so there is no second credential to manage.
 
-The overlays carry **no registry and no project id** — only a version:
+**One manual step, first run only.** A new GHCR package is **private**, and the cluster
+pulls anonymously with no pull secret. Make it public or every pod sits in
+`ImagePullBackOff`:
+
+```
+https://github.com/users/<owner>/packages/container/product-catalog/settings
+-> Danger Zone -> Change visibility -> Public
+```
+
+There is no API for this — `PATCH /user/packages/container/...` returns 404. It is UI
+only.
+
+Verify the way the kubelet will, with no docker and no cached credentials:
+
+```bash
+TOK=$(curl -s "https://ghcr.io/token?service=ghcr.io&scope=repository:ofirc/product-catalog:pull" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
+curl -s -o /dev/null -w "%{http_code}\n" -H "Authorization: Bearer $TOK" \
+  https://ghcr.io/v2/ofirc/product-catalog/manifests/v1.1.0
+# 200 = the cluster can pull
+```
+
+Do not check this with `docker manifest inspect`. Docker Desktop's credential helper
+supplies your login even when you point `DOCKER_CONFIG` at an empty directory, so a
+private package reports as readable and you find out later, from `ImagePullBackOff`.
+
+<details>
+<summary><b>Why GHCR and not Artifact Registry</b></summary>
+
+The image reference has to be committed to this repo, because **Argo CD renders the
+overlays from GitHub, not from your laptop**. There is no shell and no substitution at
+sync time, so whatever is in the commit is what gets deployed.
+
+An Artifact Registry path embeds a cloud project id, which would then live in public
+git history. A GHCR path contains only a GitHub owner, which this repo already
+discloses. So the overlays are static and carry nothing new:
 
 ```yaml
 images:
   - name: product-catalog
+    newName: ghcr.io/ofirc/product-catalog
     newTag: v1.1.0          # the only line /sre drift fix touches
 ```
 
-The registry is injected by the Argo CD Application at sync time
-(`spec.source.kustomize.images`), which `03-argocd.sh` substitutes from your project.
-Nothing project-specific is ever committed, and the same overlays work in anyone's
-account.
+Nothing is substituted and nothing has to be regenerated before `03-argocd.sh`.
 
-That split is worth keeping even outside a public repo: the overlay holds *what version
-should run*, which is a release decision and the thing the agent edits, while the
-Application holds *where images come from*, which is infrastructure. Verify the render:
+The agent's own image still goes to Artifact Registry in `04-agent.sh`. That reference
+is passed to Cloud Run as a command-line flag and never committed, so it leaks nothing.
+
+**Build for `linux/amd64` explicitly.** GKE nodes are amd64. On an Apple Silicon Mac the
+default build is arm64, and those images pull perfectly and then crash-loop with `exec
+format error`, which reads like an application bug rather than a build problem.
+`02-stack.sh` passes `--platform` and re-inspects each pushed image to confirm.
+</details>
+
+<details>
+<summary><b>Why the registry cannot live in the Argo CD Application instead</b></summary>
+
+It looks like `spec.source.kustomize.images` should solve the project-id problem: put
+the version in the overlay, the registry in the Application, commit neither. It does
+not work.
+
+An image override there **replaces** the overlay's `images` entry for that name rather
+than merging with it. Setting only the image name discards `newTag`, kustomize falls
+back to the tag in the base manifest, and every environment silently deploys
+`product-catalog:latest` — which does not exist, so the pods sit in
+`ImagePullBackOff`.
+
+The trap is that it renders correctly if you test it by *appending* a second entry to
+the overlay's own `images:` list, because kustomize merges those. That is not what Argo
+CD does.
 
 ```bash
 kubectl kustomize gitops/overlays/prod | grep -E 'image:|APP_VERSION' -A1
-# image: product-catalog:v1.1.0      <- registry added by Argo CD, tag from here
+# image: ghcr.io/ofirc/product-catalog:v1.1.0
 # APP_VERSION: v1.1.0
 ```
-Moving git forward again changes nothing. The useful edit is *backwards*:
+</details>
+
+---
+
+## 5. Wire up Argo CD
+
+```bash
+./03-argocd.sh
+```
+
+This is the step that used to be a wall of manual `kubectl` patches. It now:
+
+1. Registers the three Argo CD applications, which starts the sync.
+2. Publishes the Argo CD API on an **internal** load balancer, reachable from the VPC
+   and not from the internet.
+3. Creates a dedicated `sre-agent` Argo CD account scoped to **get and sync only**.
+4. Mints its token and writes `ARGOCD_BASE_URL` + `ARGOCD_TOKEN` into `.env`.
+
+### Checkpoint: see it in the Argo CD UI
+
+Worth doing once, before any Slack command exists. This is the picture the agent is
+reading over the API, and seeing it yourself makes every later `/sre` answer easy to
+sanity-check.
+
+```bash
+kubectl port-forward -n argocd svc/argocd-server 8080:443 >/dev/null 2>&1 &
+kubectl -n argocd get secret argocd-initial-admin-secret \
+  -o jsonpath='{.data.password}' | base64 -d; echo
+open https://localhost:8080        # username: admin, password from above
+```
+
+Your browser will warn about the certificate. That is expected: Argo CD serves a
+self-signed cert by default, which is the same reason the agent sets
+`ARGOCD_INSECURE=true`. Click through.
+
+**What good looks like** — three applications, all `Synced` and `Healthy`:
+
+```
+product-catalog-test    Synced   Healthy
+product-catalog-stage   Synced   Healthy
+product-catalog-prod    Synced   Healthy
+```
+
+Click into `product-catalog-prod` and the resource tree shows the Deployment, ReplicaSet
+and three Pods. Open the Deployment manifest and check the image tag reads `v1.1.0`
+while stage reads `v1.2.0`. That difference *is* the drift the demo finds, visible
+before the agent says a word.
+
+The same check without a browser:
+
+```bash
+kubectl get applications -n argocd
+kubectl get deploy -A -l app.kubernetes.io/name=product-catalog \
+  -o custom-columns='NS:.metadata.namespace,READY:.status.readyReplicas,IMAGE:.spec.template.spec.containers[0].image'
+```
+
+**If health is not `Healthy`**, read it here rather than guessing later:
+
+| What you see | Meaning |
+| --- | --- |
+| `Synced` / `Progressing` | pods still starting, Autopilot is scheduling nodes. Wait |
+| `Synced` / `Degraded` with `ImagePullBackOff` | the rendered image tag does not exist in the registry. Compare the pod's image against `gcloud artifacts docker images list` |
+| `Unknown` / `ComparisonError` | Argo cannot read the repo. The path or branch is wrong, or the commit was never pushed |
+| `OutOfSync` | git and the cluster disagree. For this demo that is the interesting case, not a failure |
+
+Stop the port-forward when done:
+
+```bash
+kill %1    # or: pkill -f 'port-forward.*argocd-server'
+```
+
+<details>
+<summary><b>How the agent reaches a cluster it has no credentials for</b></summary>
+
+The agent holds no kubeconfig and no GKE IAM. It reads cluster state only through the
+Argo CD API, with an Argo CD account that can `get` and `sync` and nothing else. One
+component holds cluster-admin, and the agent's access is a token you can attribute in
+the audit log and revoke on its own.
+
+That API has to be reachable from Cloud Run, which is outside the cluster. Two pieces
+make that work and both are easy to miss:
+
+- `03-argocd.sh` turns `argocd-server` into an **internal** load balancer
+  (`networking.gke.io/load-balancer-type: Internal`), so the address lives on the VPC.
+- `04-agent.sh` passes `--network` / `--subnet`, giving the Cloud Run instance **Direct
+  VPC egress**. Without it the instance has only public internet egress and every Argo CD
+  call times out, which looks exactly like a bad token.
+
+**TLS is skipped against Argo CD** (`ARGOCD_INSECURE=true`, the default). A default Argo
+CD install serves a self-signed certificate, so a correct client refuses to talk to it.
+The connection is still encrypted and still crosses only private addresses, but the
+server end is unauthenticated. It is scoped to this one provider in
+`httpx.InsecureTransport`. The real fix is a certificate the agent trusts, via
+cert-manager with an internal CA, and that is out of scope for a workshop.
+</details>
+
+---
+
+## 6. Run the agent locally
+
+Before containerising anything, check the whole chain works. Socket Mode means no
+tunnel, no ngrok, no public URL.
+
+```bash
+cd ..
+kubectl port-forward -n argocd svc/argocd-server 8080:443 &
+set -a && source .env && set +a
+ARGOCD_BASE_URL=https://localhost:8080 go run ./cmd/agent
+```
+
+```json
+{"msg":"connected to slack with socket mode","bot":"sre-agent","team":"Harness Engineering"}
+```
+
+Then in Slack, `/sre doctor`. The override matters: `.env` holds the internal load
+balancer address from step 5, which your laptop cannot route to.
+
+<details>
+<summary><b>What the code is, and the three decisions worth defending</b></summary>
+
+```
+cmd/agent/main.go              socket loop, ack, event fan-out
+internal/config/               env -> Config, with fail-fast token validation
+internal/slackio/              Reporter: one message that keeps updating
+internal/commands/
+  router.go                    the noun-verb spec table, aliases, backpressure
+  service.go                   service list, service get
+  version.go                   version get, version diff, rollout status
+  drift.go                     drift list, drift debug, drift fix
+  interactions.go              buttons, routed back through Dispatch
+internal/drift/                the diff engine. Pure, no I/O
+internal/providers/
+  httpx/                       one place for timeouts, retries, error redaction
+  argocd/  github/  gitops/    actual state, PRs, desired state
+  grafana/ jira/               symptoms and reports
+internal/llm/vertex.go         triage narration, with a deterministic fallback
+```
+
+```bash
+go build ./... && go test ./...
+```
+
+**Ack before you work.** Slack gives a slash command three seconds. The socket loop acks
+immediately and hands off to a goroutine, so a four-minute triage and a 200ms version
+lookup are the same code path:
+
+```go
+case socketmode.EventTypeSlashCommand:
+    cmd, _ := evt.Data.(slack.SlashCommand)
+    client.Ack(*evt.Request)                      // always first
+    go router.Dispatch(ctx, cmd.ChannelID, cmd.UserID, cmd.UserName, cmd.Text)
+```
+
+**The model explains, it does not decide.** Every fact in a triage is gathered
+deterministically by the providers. Vertex receives the assembled evidence and ranks it.
+It never picks what to fetch and never calls a tool, so a bad generation produces a
+confusing paragraph rather than an unexpected API call against prod. If Vertex is
+unconfigured or erroring, `deterministicNarrative` encodes the same reasoning and the
+demo does not go blank.
+
+**The fix direction depends on the finding.** This is the subtle one, and getting it
+backwards is the easiest mistake in the whole program:
+
+- A **promotion gap** means git itself encodes the lag. Stage runs v1.2.0, the prod
+  overlay still pins v1.1.0, and both environments match their own overlay. The fix moves
+  the prod overlay *forward*.
+- A **version skew or failed sync** means git is already ahead and the cluster could not
+  get there. Moving git forward again changes nothing. The useful edit is *backwards*:
   pin the overlay to the version actually running, so Argo stops retrying a broken
   release and git stops lying. Rolling forward is a human decision that needs the broken
   image fixed first.
@@ -372,7 +612,7 @@ product-catalog  test,stage,prod   v1.1.0  🟠 promotion-gap
 
 ```
 product-catalog
-us-east1-docker.pkg.dev/PROJECT_ID/stack/product-catalog
+ghcr.io/ofirc/product-catalog
 
 ENV    RUNNING  GIT     SYNC    HEALTH   LAST SYNC
 test   v1.2.0   v1.2.0  Synced  Healthy  2h ago
@@ -536,20 +776,21 @@ registry to update, and no redeploy of the agent.
 Onboarding `checkout` is two edits and no Go:
 
 1. **Add it to each overlay's `images` block.** The service name the agent uses is the
-   last path element of the image reference, so
-   `us-east1-docker.pkg.dev/$PROJECT/stack/checkout` becomes `checkout`.
+   last path element of the image reference, so `ghcr.io/ofirc/checkout` becomes
+   `checkout`.
 
    ```yaml
    images:
      - name: product-catalog
+       newName: ghcr.io/ofirc/product-catalog
        newTag: v1.1.0
      - name: checkout
+       newName: ghcr.io/ofirc/checkout
        newTag: v2.4.1
    ```
 
 2. **Add an Argo CD Application per environment**, carrying the two labels. Copy
-   `deploy/argocd/application-prod.yaml` and change the name, path, labels and the
-   `kustomize.images` entry.
+   `deploy/argocd/application-prod.yaml` and change the name, path and labels.
    `app.kubernetes.io/name` must match the image's last path element, or the desired and
    actual sides will not join and the service will show up twice, once as `missing` and
    once as `undeclared`.

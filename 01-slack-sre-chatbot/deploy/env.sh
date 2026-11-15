@@ -19,6 +19,23 @@ export AR_REPO="${AR_REPO:-stack}"
 export AR_HOST="${REGION}-docker.pkg.dev"
 export AR_PATH="${AR_HOST}/${PROJECT}/${AR_REPO}"
 
+# Demo workload images live on GHCR, not Artifact Registry.
+#
+# Not a preference: an Artifact Registry path embeds the project id, and the image
+# reference has to be committed to this repo because Argo CD renders the overlays from
+# GitHub. GHCR paths contain only a GitHub owner, which is already public here, so the
+# repo stays free of anyone's cloud account.
+#
+# The agent's own image still goes to Artifact Registry (04-agent.sh). That reference
+# is passed to Cloud Run as a flag and never committed, so it leaks nothing.
+export GHCR_OWNER="${GHCR_OWNER:-ofirc}"
+export STACK_IMAGE="${STACK_IMAGE:-ghcr.io/${GHCR_OWNER}/product-catalog}"
+
+# GKE nodes are linux/amd64. This Mac is arm64, and a plain `docker build` would push
+# an arm64 image that dies on the cluster with "exec format error", after a pull that
+# looked perfectly healthy.
+export BUILD_PLATFORM="${BUILD_PLATFORM:-linux/amd64}"
+
 export CLUSTER="${CLUSTER:-sre-demo}"
 
 # Direct VPC egress for the agent instance. The Argo CD API is published on an internal
