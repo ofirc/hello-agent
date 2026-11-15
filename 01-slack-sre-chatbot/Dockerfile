@@ -24,7 +24,8 @@ FROM gcr.io/distroless/static-debian12:nonroot
 
 COPY --from=build /out/agent /agent
 
-USER nonroot:nonroot
+# Numeric, not `nonroot`: Kubernetes runAsNonRoot cannot verify a username.
+USER 65532:65532
 
 # Socket Mode dials out. Nothing listens, so there is no EXPOSE and no port to publish.
 ENTRYPOINT ["/agent"]

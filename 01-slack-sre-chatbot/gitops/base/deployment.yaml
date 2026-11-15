@@ -20,6 +20,14 @@ spec:
     spec:
       securityContext:
         runAsNonRoot: true
+        # 65532 is distroless's "nonroot" user. The number is required, not optional:
+        # the image's USER directive says `nonroot` by name, and the kubelet cannot
+        # verify a name is non-root, so with runAsNonRoot it refuses to start the
+        # container with CreateContainerConfigError. The image pulls fine, which makes
+        # it read like a registry problem when it is not.
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
       containers:

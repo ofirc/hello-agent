@@ -8,6 +8,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/product
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/product-catalog /product-catalog
-USER nonroot:nonroot
+# Numeric, not `nonroot`: Kubernetes runAsNonRoot cannot verify a username.
+USER 65532:65532
 EXPOSE 8080
 ENTRYPOINT ["/product-catalog"]
