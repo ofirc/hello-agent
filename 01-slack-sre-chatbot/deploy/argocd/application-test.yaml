@@ -1,0 +1,35 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: product-catalog-test
+  namespace: argocd
+  labels:
+    # The agent reads these two labels to map an Argo CD application back to a
+    # service and an environment. Without them it falls back to splitting the
+    # application name on the last hyphen.
+    app.kubernetes.io/name: product-catalog
+    app.kubernetes.io/part-of: test
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/ofirc/hello-agent.git
+    targetRevision: main
+    path: 01-slack-sre-chatbot/gitops/overlays/test
+    # The registry lives here, not in the overlay, so the GitOps repo carries no
+    # project id. 03-argocd.sh substitutes IMAGE_REPO at apply time.
+    #
+    # Only the image *name* is overridden. The tag still comes from the overlay's
+    # newTag, which is the single line /sre drift fix edits and the single value the
+    # agent compares against the cluster.
+    kustomize:
+      images:
+        - product-catalog=IMAGE_REPO/product-catalog
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: test
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

@@ -1,0 +1,106 @@
+# Slack app manifest for the SRE Agent.
+#
+# Paste the whole file into api.slack.com/apps -> Create new app -> From scratch ->
+# Paste a manifest. Comments are ignored by Slack's parser.
+#
+#   pbcopy < manifest.yaml
+#
+# This file is the canonical copy. The README describes it but does not duplicate it,
+# so there is only one place to edit when a command needs a new scope.
+#
+# After creating the app you need two tokens:
+#   1. Basic Information -> App-Level Tokens -> Generate, scope connections:write
+#      -> SLACK_APP_TOKEN (xapp-...). Socket Mode will not connect without it.
+#   2. Install App -> Install to <workspace> -> Allow
+#      -> SLACK_BOT_TOKEN (xoxb-...), also shown on OAuth & Permissions
+#      Installing is also what registers /sre and creates the @sre-agent bot user.
+#
+# Editing scopes later requires a reinstall. Scope changes do not take effect on an
+# already-installed app, and the symptom is a missing_scope error at runtime.
+
+display_information:
+  name: SRE Agent
+  description: ChatOps SRE agent - deployed versions, release drift, and fix PRs
+  background_color: "#3097D1"
+  long_description: >-
+    SRE Agent answers production deployment questions from Slack. It reports the version
+    of each service running in test, stage and prod, diffs those environments against
+    the GitOps repo to surface release drift, triages failed rollouts against Argo CD,
+    Grafana and JIRA, and prepares a pull request that realigns a lagging environment.
+    It connects over Socket Mode, so it exposes no inbound endpoint.
+
+features:
+  bot_user:
+    display_name: sre-agent
+    # Honest: the agent really is always on, it runs as a Cloud Run instance rather
+    # than a scale-to-zero service.
+    always_online: true
+
+  # The assistant side panel. If the manifest validator rejects this block, delete it
+  # and install without it. Nothing in the agent depends on it.
+  assistant_view:
+    assistant_description: Ask me about deployed versions, release drift and failed rollouts.
+    suggested_prompts:
+      - title: Deployed versions
+        message: Which version of each service is running in prod right now?
+      - title: Find drift
+        message: Is there any drift between stage and prod?
+      - title: Triage it
+        message: Why is product-catalog behind in prod?
+
+  slash_commands:
+    # One command with noun-verb subcommands, parsed by internal/commands/router.go.
+    # Socket Mode means no url field is needed here.
+    - command: /sre
+      description: Services, deployment versions, release drift, and fix PRs
+      usage_hint: service list | version get [env] | drift list | drift debug | drift fix <svc>
+      should_escape: false
+
+oauth_config:
+  scopes:
+    bot:
+      # /sre itself
+      - commands
+      # @sre-agent in a channel, plus reading the surrounding thread for triage context
+      - app_mentions:read
+      - channels:history
+      - groups:history
+      # posting results, including into channels the bot was never invited to
+      - chat:write
+      - chat:write.public
+      # drift diffs and Argo CD manifests exceed the 3000-character block limit
+      - files:write
+      # progress signalling on a triage with a two-minute p50
+      - reactions:write
+      # DM conversations with the agent
+      - im:history
+      - im:read
+      - im:write
+      # mapping the Slack caller to a GitHub and JIRA identity, which is what makes
+      # the on-behalf-of audit trail real
+      - users:read
+      - users:read.email
+      # the assistant side panel
+      - assistant:write
+      # "open temporary Slack rooms for shared triage", from the below-the-line reqs
+      - channels:manage
+      - groups:write
+
+settings:
+  event_subscriptions:
+    bot_events:
+      - app_mention
+      - message.im
+      - assistant_thread_started
+      - assistant_thread_context_changed
+
+  # drift debug ends in buttons and drift fix posts a review link.
+  interactivity:
+    is_enabled: true
+
+  # The whole point: the agent dials out and holds a WebSocket open. No inbound
+  # listener, no public URL, no request signature to verify.
+  socket_mode_enabled: true
+
+  org_deploy_enabled: false
+  token_rotation_enabled: false

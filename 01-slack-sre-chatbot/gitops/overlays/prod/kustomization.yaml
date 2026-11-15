@@ -1,0 +1,56 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: prod
+
+resources:
+  - ../../base
+
+patches:
+  - target:
+      kind: Deployment
+      name: product-catalog
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/env/2/value
+        value: prod
+      - op: replace
+        path: /spec/replicas
+        value: 3
+  # part-of is what the agent reads to work out which environment an Argo CD
+  # application belongs to.
+  - target:
+      kind: Deployment
+      name: product-catalog
+    patch: |-
+      - op: add
+        path: /metadata/labels/app.kubernetes.io~1part-of
+        value: prod
+
+# The SRE agent edits exactly one line in this file: the newTag below.
+#
+# There is deliberately no registry here. The image name is set by the Argo CD
+# Application (spec.source.kustomize.images), so this repo carries no project id and
+# the same overlays work in anyone's account. This file holds the version and nothing
+# else, which is exactly what /sre drift fix needs to change.
+images:
+  - name: product-catalog
+    newTag: v1.1.0
+
+# APP_VERSION is derived from the image tag rather than duplicated, so there is exactly
+# one place to change a version and the running pod can never disagree with the tag it
+# was deployed from.
+replacements:
+  - source:
+      kind: Deployment
+      name: product-catalog
+      fieldPath: spec.template.spec.containers.[name=product-catalog].image
+      options:
+        delimiter: ":"
+        index: 1
+    targets:
+      - select:
+          kind: Deployment
+          name: product-catalog
+        fieldPaths:
+          - spec.template.spec.containers.[name=product-catalog].env.[name=APP_VERSION].value

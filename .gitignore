@@ -1,0 +1,44 @@
+# Secrets. Nothing matching these should ever reach a commit.
+#
+# The agent reads every credential from the environment, which makes it easy to keep a
+# scratch file of exports next to the code. That convenience is exactly how tokens get
+# committed, so the patterns are deliberately broad.
+.env
+.env.*
+!.env.example
+.envrc
+.tokens
+.tokens.*
+tokens
+tokens.*
+*.token
+*.tokens
+secrets.yaml
+*-credentials.json
+service-account*.json
+
+# Editor leftovers. A vim swap file holds the full buffer, so a swap file of a token
+# file is a token file.
+*.swp
+*.swo
+*~
+.DS_Store
+.idea/
+.vscode/
+
+# Screenshots and scratch images. Captured while working, not part of the repo, and
+# they routinely contain tokens and project identifiers in the frame.
+Screenshot*.png
+Screenshot*.jpg
+Screen?Shot*.png
+
+# Go
+/bin/
+/out/
+*.test
+coverage.out
+
+# Compiled binaries. Go names the output after its directory, so these have no
+# extension and no glob catches them.
+01-slack-sre-chatbot/stack/product-catalog/product-catalog
+01-slack-sre-chatbot/agent
