@@ -1,0 +1,140 @@
+#!/bin/sh
+# Local stand-in for the Cloud Run sandbox CLI (/usr/local/gcp/bin/sandbox).
+# sre-agent-sandbox-shim  <- the agent looks for this marker, so wherever SANDBOX_CLI
+# points here it labels the runner "shim" and SANDBOX=auto never picks it. Keep it in
+# the first 1 KB of the file.
+#
+# THIS PROVIDES NO ISOLATION. The model's code runs as the agent's own user, in the
+# agent's own container (or on your Mac with `go run`), with network access. It cannot
+# see the agent's environment variables directly, because the runner starts this script
+# with PATH only, but same-uid code can read them from /proc/<pid>/environ.
+#
+# Why it exists: with SANDBOX=shim the agent uses the same Cloud Run runner code as
+# production (arguments, timeouts, output truncation, startup probe) without needing a
+# Cloud Run sandbox or the Docker socket. For isolated local runs, use the Docker runner
+# instead (compose.docker-sandbox.yaml).
+#
+# It accepts exactly what the runner sends:
+#
+#   do [--mount type=bind,source=DIR,destination=/data,readonly] -- INTERPRETER /data/FILE
+#
+# rewrites /data/... to DIR/..., and execs. It ignores other options and never adds any.
+set -eu
+
+usage() {
+  echo "usage: sandbox-shim do [--mount type=bind,source=DIR,destination=/data[,readonly]] -- COMMAND [ARGS...]" >&2
+  exit 2
+}
+
+if [ "$#" -eq 0 ] || [ "$1" != "do" ]; then
+  usage
+fi
+shift
+
+src=""
+seen_separator=0
+
+# mount_source SPEC: the source= field of a comma-separated --mount value. Paths with
+# spaces survive because only commas split it, and globbing is off while it does.
+mount_source() {
+  set -f
+  old_ifs=$IFS
+  IFS=,
+  for field in $1; do
+    case "$field" in
+      source=*) src=${field#source=} ;;
+    esac
+  done
+  IFS=$old_ifs
+  set +f
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --)
+      shift
+      seen_separator=1
+      break
+      ;;
+    --mount)
+      [ "$#" -ge 2 ] || usage
+      mount_source "$2"
+      shift 2
+      ;;
+    --mount=*)
+      mount_source "${1#--mount=}"
+      shift
+      ;;
+    *)
+      # Anything else the real CLI understands (--write, --env, ...) is ignored: the
+      # runner never sends them, and honouring them here would mean nothing anyway.
+      shift
+      ;;
+  esac
+done
+
+if [ "$seen_separator" -ne 1 ] || [ "$#" -eq 0 ]; then
+  usage
+fi
+
+# The runner asks for /usr/bin/python3 and /usr/bin/bash, which is where the agent
+# image has them. macOS has bash at /bin/bash, so fall back to the name on PATH.
+interpreter=$1
+shift
+if [ ! -x "$interpreter" ]; then
+  found=$(command -v "${interpreter##*/}" || true)
+  if [ -z "$found" ]; then
+    echo "sandbox-shim: interpreter not found: $interpreter" >&2
+    exit 127
+  fi
+  interpreter=$found
+fi
+
+# Rebuild the argument list in place, so an argument containing spaces stays one
+# argument: append each (rewritten) argument, then drop the originals.
+count=$#
+for arg in "$@"; do
+  if [ -n "$src" ]; then
+    case "$arg" in
+      /data) arg=$src ;;
+      /data/*) arg=$src/${arg#/data/} ;;
+    esac
+  fi
+  set -- "$@" "$arg"
+done
+shift "$count"
+
+# The code itself reads /data too: the probe opens /data/probe.txt and the skills tell
+# the model its evidence is under /data. There is no mount here to make /data exist, so
+# point those paths at the run directory inside the code file as well. Only whole-token
+# /data paths are rewritten: after the start of a line, a quote, whitespace or shell or
+# Python punctuation, and before "/", a quote, whitespace, punctuation or the end of the
+# line. So /var/data/... is left alone. The expression runs twice because a match
+# consumes the character after /data, which may be the one the next /data needs before
+# it ("ls /data /data/x"). Code that builds the path another way will not find its
+# files, and says so with its own file-not-found error. The rewrite is textual, so a run
+# directory containing a space would break unquoted shell code; run directories never
+# contain one.
+if [ -n "$src" ] && [ "$#" -gt 0 ]; then
+  case "$1" in
+    "$src"/*)
+      if [ -f "$1" ]; then
+        escaped=$(printf '%s\n' "$src" | sed 's/[#&\\]/\\&/g')
+        before='(^|["'"'"'`[:space:](=,;|&<>{])'
+        after='(["'"'"'`/[:space:]),;|&<>}]|$)'
+        rewrite="s#${before}/data${after}#\\1${escaped}\\2#g"
+        tmp="$1.shim.$$"
+        sed -E -e "$rewrite" -e "$rewrite" "$1" >"$tmp"
+        mv "$tmp" "$1"
+      fi
+      ;;
+  esac
+  # Start in the run directory, as code in a real sandbox would start nowhere near the
+  # agent's files. Here the agent's working directory holds .env.local, so a relative
+  # path in model code must not resolve against it.
+  if [ -d "$src" ]; then
+    cd "$src"
+  fi
+fi
+
+exec "$interpreter" "$@"

@@ -1,0 +1,43 @@
+#
+.env
+.env.*
+!.env.example
+.envrc
+.tokens
+.tokens.*
+tokens
+tokens.*
+*.token
+*.tokens
+secrets.yaml
+*-credentials.json
+service-account*.json
+
+# Editor leftovers. A vim swap file holds the full buffer, so a swap file of a token
+# file is a token file.
+*.swp
+*.swo
+*~
+.DS_Store
+.idea/
+.vscode/
+
+!**/docs/images/**
+
+# Go
+/bin/
+/out/
+*.test
+coverage.out
+
+# Local worktrees and agent scratch space.
+.worktrees/
+.superpowers/
+
+# Compiled binaries. Go names the output after its directory, so these have no
+# extension and no glob catches them.
+01-slack-sre-chatbot/stack/product-catalog/product-catalog
+01-slack-sre-chatbot/agent
+
+# Local kind stack scratch: per-run evidence the agent writes under .local/runs.
+01-slack-sre-chatbot/.local/

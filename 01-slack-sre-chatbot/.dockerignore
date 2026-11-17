@@ -1,0 +1,20 @@
+# Kept out of the agent image's build context (compose.yaml `build: .`, up.sh, and the
+# Cloud Build of 04-agent.sh all send this directory).
+#
+# The build stage runs `COPY . .`, so anything left here lands in that layer and stays
+# in the local BuildKit cache, even though the final image only copies the binary. The
+# token files must never get there. The build needs only go.mod, go.sum, cmd/,
+# internal/ and skills/, so .env.example goes too.
+.env
+.env.*
+
+# Per-run evidence the local agent writes and removes on every run, plus .env.local,
+# which up.sh rewrites: either would invalidate `COPY . .` and force a full go build on
+# every `docker compose up --build`. On Linux the agent's 0700 run directories would
+# also make the context unreadable.
+.local/
+
+# Not needed to build, and a needless cache buster.
+.git
+*.test
+coverage.out

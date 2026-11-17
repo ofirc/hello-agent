@@ -1,0 +1,41 @@
+# Opt-in: isolated code runs through the Docker runner, merged on top of compose.yaml.
+#
+#   docker compose -f compose.yaml -f compose.docker-sandbox.yaml up --build
+#
+# Each run_code call becomes a throwaway sibling container from sre-agent:local with no
+# network, no environment, a read-only root filesystem, all capabilities dropped, and the
+# run's evidence mounted read-only at /data. The price is the Docker socket below.
+#
+# Run compose from this directory (01-slack-sre-chatbot/). AGENT_WORKDIR is the same
+# absolute path on the host and in the container, built from ${PWD}; from anywhere else
+# the mount lands somewhere else, the Docker probe reads an empty /data, and /sre doctor
+# shows `sandbox (docker)` as a failure.
+#
+# What was and was not verified: `docker compose config` parses the merged file. The
+# socket group and the run-directory permissions were written for Docker Desktop for Mac
+# without being run against it, so treat them as the likeliest setup, not a tested one.
+# The check, and what to change, are in the README under "Run it locally on kind".
+services:
+  agent:
+    environment:
+      SANDBOX: docker
+      SANDBOX_IMAGE: sre-agent:local
+      AGENT_WORKDIR: ${PWD}/.local/runs
+    # Inside Docker Desktop containers the mounted socket is usually owned by root with
+    # group root (gid 0) and mode 660, so the non-root agent needs that one group and
+    # nothing else to talk to it. The process keeps uid 65532 and gains no capabilities.
+    # UNVERIFIED on this setup. Check with:
+    #   docker compose exec agent ls -ln /var/run/docker.sock
+    # and if the group is not 0, put that gid here instead.
+    group_add: ["0"]
+    volumes:
+      # Gives this container control of the host's Docker. See the README before
+      # changing it: that is the price of the Docker code runner.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # The same absolute path on both sides, on purpose. The daemon resolves a code-run
+      # container's bind mount on the HOST, not in this container, so the evidence
+      # folder has to exist at one path in both places. up.sh creates it as 1777 (like
+      # /tmp) so uid 65532 can create its per-run 0700 directories in it. UNVERIFIED on
+      # Docker Desktop's file sharing; the agent's startup probe reports a failure as
+      # `sandbox (docker)` being unavailable instead of failing every run_code call.
+      - ${PWD}/.local/runs:${PWD}/.local/runs

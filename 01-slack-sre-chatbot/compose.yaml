@@ -1,0 +1,40 @@
+# The agent, running in a container next to the local kind cluster. Start the cluster
+# first (./deploy/local/up.sh): it creates the `kind` network this file joins, builds the
+# sre-agent:local image and writes .env.local. Run compose from this directory
+# (01-slack-sre-chatbot/), where .env.local and deploy/local/sandbox-shim are.
+#
+# Code runs: by default the agent uses the shim (SANDBOX=shim), the same Cloud Run runner
+# code as production, pointed at deploy/local/sandbox-shim mounted where the Cloud Run CLI
+# would be. THE SHIM PROVIDES NO ISOLATION: the model's code runs in this container, as
+# the agent's user, with network access, and can read the agent's tokens through
+# /proc/<pid>/environ. That is the price of parity without the Docker socket. For
+# isolated runs, add the Docker runner override:
+#
+#   docker compose -f compose.yaml -f compose.docker-sandbox.yaml up --build
+name: sre-agent-local
+services:
+  agent:
+    build: .
+    # The same image the Docker code runner starts code-run containers from, when the
+    # override is used (SANDBOX_IMAGE=sre-agent:local).
+    image: sre-agent:local
+    env_file: .env.local
+    environment:
+      # .env.local holds host-side values so `go run` works as is. These differ inside a
+      # container: Argo CD is reached over kind's Docker network by node name, Ollama runs
+      # on the host, the shim is mounted at the Cloud Run CLI's own path, and the run
+      # directory is this container's temp directory (the host path in .env.local does
+      # not exist in here, and the shim needs no shared folder).
+      ARGOCD_BASE_URL: https://sre-local-control-plane:30443
+      OLLAMA_BASE_URL: http://host.docker.internal:11434/v1
+      SANDBOX: shim
+      SANDBOX_CLI: /usr/local/gcp/bin/sandbox
+      AGENT_WORKDIR: ""
+    # The agent runs as the image's own non-root user (65532:65532). Nothing here raises
+    # that, and nothing here reaches the host's Docker.
+    volumes:
+      - ./deploy/local/sandbox-shim:/usr/local/gcp/bin/sandbox:ro
+    networks: [kind]
+networks:
+  kind:
+    external: true
