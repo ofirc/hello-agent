@@ -38,7 +38,7 @@ patches:
 images:
   - name: product-catalog
     newName: ghcr.io/ofirc/product-catalog
-    newTag: v1.1.0
+    newTag: v1.2.0
 
 # APP_VERSION is derived from the image tag rather than duplicated, so there is exactly
 # one place to change a version and the running pod can never disagree with the tag it
