@@ -10,6 +10,8 @@ tokens.*
 *.token
 *.tokens
 secrets.yaml
+# GitHub App private keys. Keep them outside the repo; this is the second line.
+*.pem
 *-credentials.json
 service-account*.json
 

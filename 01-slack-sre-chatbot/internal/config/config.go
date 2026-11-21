@@ -2,7 +2,8 @@
 //
 // Nothing is read from disk and nothing is baked into the image. On Cloud Run the
 // secret-backed values arrive via --set-secrets, which projects Secret Manager versions
-// into the process environment.
+// into the process environment. The one path to a file, GITHUB_APP_PRIVATE_KEY_FILE, is
+// for laptops, and the GitHub provider reads it, not this package.
 package config
 
 import (
@@ -17,12 +18,17 @@ type Config struct {
 	SlackBotToken string // xoxb-..., bot token
 	SlackAppToken string // xapp-..., app-level token with connections:write
 
-	// GitOps repo: the desired state.
-	GitHubToken  string
-	GitHubOwner  string
-	GitHubRepo   string
-	GitHubBase   string // base branch for fix PRs, e.g. "main"
-	GitOpsPrefix string // path prefix of the overlays, e.g. "gitops/overlays"
+	// GitOps repo: the desired state. The App, when set, is who opens fix PRs, and the
+	// token is the fallback when the App cannot mint one. Either alone also works.
+	GitHubAppID             string
+	GitHubAppInstallationID string // optional, looked up from the repo when empty
+	GitHubAppPrivateKey     string // PEM contents, how Cloud Run gets it from Secret Manager
+	GitHubAppPrivateKeyFile string // path to the .pem, how a laptop gets it
+	GitHubToken             string
+	GitHubOwner             string
+	GitHubRepo              string
+	GitHubBase              string // base branch for fix PRs, e.g. "main"
+	GitOpsPrefix            string // path prefix of the overlays, e.g. "gitops/overlays"
 
 	// Argo CD: the actual state.
 	ArgoCDBaseURL  string
@@ -76,41 +82,45 @@ type Config struct {
 
 func Load() (*Config, error) {
 	c := &Config{
-		SlackBotToken:  os.Getenv("SLACK_BOT_TOKEN"),
-		SlackAppToken:  os.Getenv("SLACK_APP_TOKEN"),
-		GitHubToken:    os.Getenv("GITHUB_TOKEN"),
-		GitHubOwner:    envOr("GITHUB_OWNER", "ofirc"),
-		GitHubRepo:     envOr("GITHUB_REPO", "hello-agent"),
-		GitHubBase:     envOr("GITHUB_BASE_BRANCH", "main"),
-		GitOpsPrefix:   envOr("GITOPS_PREFIX", "01-slack-sre-chatbot/gitops/overlays"),
-		ArgoCDBaseURL:  strings.TrimRight(os.Getenv("ARGOCD_BASE_URL"), "/"),
-		ArgoCDToken:    os.Getenv("ARGOCD_TOKEN"),
-		ArgoCDProject:  envOr("ARGOCD_PROJECT", "default"),
-		ArgoCDInsecure: envOr("ARGOCD_INSECURE", "true") != "false",
-		GrafanaBaseURL: strings.TrimRight(os.Getenv("GRAFANA_BASE_URL"), "/"),
-		GrafanaToken:   os.Getenv("GRAFANA_TOKEN"),
-		GrafanaDSUID:   os.Getenv("GRAFANA_DATASOURCE_UID"),
-		JIRABaseURL:    strings.TrimRight(os.Getenv("JIRA_BASE_URL"), "/"),
-		JIRAEmail:      os.Getenv("JIRA_EMAIL"),
-		JIRAToken:      os.Getenv("JIRA_TOKEN"),
-		JIRAProject:    os.Getenv("JIRA_PROJECT"),
-		VertexProject:  os.Getenv("VERTEX_PROJECT"),
-		VertexLocation: envOr("VERTEX_LOCATION", "us-east1"),
-		VertexModel:    envOr("VERTEX_MODEL", "gemini-2.5-pro"),
-		ModelProvider:  os.Getenv("MODEL_PROVIDER"),
-		OllamaBaseURL:  envOr("OLLAMA_BASE_URL", "http://localhost:11434/v1"),
-		OllamaModel:    envOr("OLLAMA_MODEL", "sre-qwen3:14b"),
-		SandboxMode:    envOr("SANDBOX", "auto"),
-		SandboxImage:   envOr("SANDBOX_IMAGE", "sre-agent:local"),
-		SandboxCLI:     envOr("SANDBOX_CLI", "/usr/local/gcp/bin/sandbox"),
-		WorkDir:        os.Getenv("AGENT_WORKDIR"),
-		Environments:   splitOr("ENVIRONMENTS", []string{"test", "stage", "prod"}),
-		MaxConcurrent:  4,
-		QuickTimeout:   20 * time.Second,
-		TriageTimeout:  8 * time.Minute,
-		RemedyTimeout:  4 * time.Minute,
-		AllowFixEnvs:   splitOr("ALLOW_FIX_ENVS", []string{"stage", "prod"}),
-		RequireApprove: envOr("REQUIRE_APPROVE", "true") != "false",
+		SlackBotToken:           os.Getenv("SLACK_BOT_TOKEN"),
+		SlackAppToken:           os.Getenv("SLACK_APP_TOKEN"),
+		GitHubAppID:             strings.TrimSpace(os.Getenv("GITHUB_APP_ID")),
+		GitHubAppInstallationID: strings.TrimSpace(os.Getenv("GITHUB_APP_INSTALLATION_ID")),
+		GitHubAppPrivateKey:     os.Getenv("GITHUB_APP_PRIVATE_KEY"),
+		GitHubAppPrivateKeyFile: os.Getenv("GITHUB_APP_PRIVATE_KEY_FILE"),
+		GitHubToken:             os.Getenv("GITHUB_TOKEN"),
+		GitHubOwner:             envOr("GITHUB_OWNER", "ofirc"),
+		GitHubRepo:              envOr("GITHUB_REPO", "hello-agent"),
+		GitHubBase:              envOr("GITHUB_BASE_BRANCH", "main"),
+		GitOpsPrefix:            envOr("GITOPS_PREFIX", "01-slack-sre-chatbot/gitops/overlays"),
+		ArgoCDBaseURL:           strings.TrimRight(os.Getenv("ARGOCD_BASE_URL"), "/"),
+		ArgoCDToken:             os.Getenv("ARGOCD_TOKEN"),
+		ArgoCDProject:           envOr("ARGOCD_PROJECT", "default"),
+		ArgoCDInsecure:          envOr("ARGOCD_INSECURE", "true") != "false",
+		GrafanaBaseURL:          strings.TrimRight(os.Getenv("GRAFANA_BASE_URL"), "/"),
+		GrafanaToken:            os.Getenv("GRAFANA_TOKEN"),
+		GrafanaDSUID:            os.Getenv("GRAFANA_DATASOURCE_UID"),
+		JIRABaseURL:             strings.TrimRight(os.Getenv("JIRA_BASE_URL"), "/"),
+		JIRAEmail:               os.Getenv("JIRA_EMAIL"),
+		JIRAToken:               os.Getenv("JIRA_TOKEN"),
+		JIRAProject:             os.Getenv("JIRA_PROJECT"),
+		VertexProject:           os.Getenv("VERTEX_PROJECT"),
+		VertexLocation:          envOr("VERTEX_LOCATION", "us-east1"),
+		VertexModel:             envOr("VERTEX_MODEL", "gemini-2.5-pro"),
+		ModelProvider:           os.Getenv("MODEL_PROVIDER"),
+		OllamaBaseURL:           envOr("OLLAMA_BASE_URL", "http://localhost:11434/v1"),
+		OllamaModel:             envOr("OLLAMA_MODEL", "sre-qwen3:14b"),
+		SandboxMode:             envOr("SANDBOX", "auto"),
+		SandboxImage:            envOr("SANDBOX_IMAGE", "sre-agent:local"),
+		SandboxCLI:              envOr("SANDBOX_CLI", "/usr/local/gcp/bin/sandbox"),
+		WorkDir:                 os.Getenv("AGENT_WORKDIR"),
+		Environments:            splitOr("ENVIRONMENTS", []string{"test", "stage", "prod"}),
+		MaxConcurrent:           4,
+		QuickTimeout:            20 * time.Second,
+		TriageTimeout:           8 * time.Minute,
+		RemedyTimeout:           4 * time.Minute,
+		AllowFixEnvs:            splitOr("ALLOW_FIX_ENVS", []string{"stage", "prod"}),
+		RequireApprove:          envOr("REQUIRE_APPROVE", "true") != "false",
 		// Lowercased here so the gate compares like with like; Slack does not
 		// normalise the case of the email a user typed.
 		AuthorizedEmails: lowerAll(splitOr("AUTHORIZED_EMAILS", nil)),
@@ -173,7 +183,7 @@ func (c *Config) ModelName() string {
 func (c *Config) Enabled() map[string]bool {
 	return map[string]bool{
 		"argocd":  c.ArgoCDBaseURL != "" && c.ArgoCDToken != "",
-		"github":  c.GitHubToken != "",
+		"github":  c.GitHubToken != "" || c.GitHubAppID != "",
 		"grafana": c.GrafanaBaseURL != "" && c.GrafanaToken != "",
 		"jira":    c.JIRABaseURL != "" && c.JIRAToken != "",
 		"model":   c.ModelProvider != "",

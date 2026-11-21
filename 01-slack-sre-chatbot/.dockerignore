@@ -7,6 +7,7 @@
 # internal/ and skills/, so .env.example goes too.
 .env
 .env.*
+*.pem
 
 # Per-run evidence the local agent writes and removes on every run, plus .env.local,
 # which up.sh rewrites: either would invalidate `COPY . .` and force a full go build on

@@ -71,7 +71,7 @@ func run(log *slog.Logger) error {
 		return fmt.Errorf("slack auth.test failed, check SLACK_BOT_TOKEN: %w", err)
 	}
 
-	gh := github.New(cfg.GitHubToken, cfg.GitHubOwner, cfg.GitHubRepo)
+	gh := newGitHub(ctx, cfg, log)
 
 	deps := &commands.Deps{
 		Cfg:     cfg,
@@ -136,6 +136,54 @@ func run(log *slog.Logger) error {
 		return nil
 	}
 	return err
+}
+
+// newGitHub picks who the agent writes to GitHub as: the App when it is configured,
+// falling back to GITHUB_TOKEN, or the token alone. A broken App is never fatal, since
+// the token may still work and the read-only commands need neither.
+//
+// The App is probed once here, so the startup log names the identity actually in use
+// rather than the one configured, and doctor can name the bot user.
+func newGitHub(ctx context.Context, cfg *config.Config, log *slog.Logger) *github.Client {
+	var pat github.TokenSource
+	if cfg.GitHubToken != "" {
+		pat = github.StaticToken(cfg.GitHubToken)
+	}
+	app, err := github.AppFromConfig(cfg.GitHubAppID, cfg.GitHubAppInstallationID,
+		cfg.GitHubAppPrivateKey, cfg.GitHubAppPrivateKeyFile, cfg.GitHubOwner, cfg.GitHubRepo)
+	if err != nil {
+		if pat != nil {
+			log.Warn("github app misconfigured, using GITHUB_TOKEN", "err", err.Error())
+		} else {
+			log.Warn("github app misconfigured and GITHUB_TOKEN is not set, github is disabled", "err", err.Error())
+		}
+	}
+
+	var src github.TokenSource
+	switch {
+	case app != nil && pat != nil:
+		src = github.WithFallback(app, pat, log)
+	case app != nil:
+		src = app
+	case pat != nil:
+		src = pat
+	}
+	gh := github.New(src, cfg.GitHubOwner, cfg.GitHubRepo)
+
+	if app != nil {
+		probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		if _, err := app.Info(probeCtx); err != nil {
+			log.Warn("github app: could not read the App, check GITHUB_APP_ID and the private key", "err", err.Error())
+		}
+		if _, err := src.Token(probeCtx); err != nil {
+			log.Warn("github: no working credential", "err", err.Error())
+		}
+	}
+	if src != nil {
+		log.Info("github identity", "as", gh.Identity(), "repo", gh.Slug())
+	}
+	return gh
 }
 
 // newAgent builds the drift debug and fix agents over the same clients the commands use.

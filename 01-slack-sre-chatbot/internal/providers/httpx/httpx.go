@@ -127,7 +127,7 @@ func Do(c *http.Client, req *http.Request, provider string) ([]byte, error) {
 // strings get posted into a Slack channel.
 func snippet(b []byte) string {
 	s := strings.Join(strings.Fields(string(b)), " ")
-	for _, prefix := range []string{"xoxb-", "xapp-", "ghp_", "github_pat_", "Bearer "} {
+	for _, prefix := range []string{"xoxb-", "xapp-", "ghp_", "ghs_", "github_pat_", "Bearer "} {
 		if i := strings.Index(s, prefix); i >= 0 {
 			s = s[:i] + prefix + "[redacted]"
 		}

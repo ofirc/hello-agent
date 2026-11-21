@@ -30,7 +30,26 @@ need() { # need <VAR> <where it comes from>
 }
 need SLACK_BOT_TOKEN  "Slack app -> Install App -> Bot User OAuth Token (xoxb-...). Put it in .env (step 2)."
 need SLACK_APP_TOKEN  "Slack app -> Basic Information -> App-Level Tokens (xapp-...). Put it in .env (step 2)."
-need GITHUB_TOKEN     "A fine-grained PAT with Contents and Pull requests read/write. Put it in .env (step 2)."
+if [[ -z "${GITHUB_APP_ID:-}" && -z "${GITHUB_TOKEN:-}" ]]; then
+  echo "Missing GITHUB_APP_ID and GITHUB_TOKEN, set at least one." >&2
+  echo "  The GitHub App opens fix PRs as <app>[bot]; the PAT is the fallback. See README step 2b." >&2
+  exit 1
+fi
+# The App's key is uploaded from the file .env names. It reaches the instance as an
+# environment variable, never as a mounted file, because the sandbox that runs the
+# model's code reads this container's filesystem.
+if [[ -n "${GITHUB_APP_ID:-}" ]]; then
+  if [[ ! -r "${GITHUB_APP_PRIVATE_KEY_FILE:-}" ]]; then
+    echo "GITHUB_APP_ID is set but GITHUB_APP_PRIVATE_KEY_FILE (${GITHUB_APP_PRIVATE_KEY_FILE:-unset}) is not a readable file." >&2
+    echo "  Point it at the .pem the App's settings page downloaded, as an absolute path." >&2
+    exit 1
+  fi
+  if ! grep -q -- '-----BEGIN .*PRIVATE KEY-----' "$GITHUB_APP_PRIVATE_KEY_FILE"; then
+    echo "$GITHUB_APP_PRIVATE_KEY_FILE is not a PEM private key." >&2
+    exit 1
+  fi
+fi
+[[ -z "${GITHUB_TOKEN:-}" ]] && echo "    warning: GITHUB_TOKEN is not set, so there is no fallback if the GitHub App fails" >&2
 need ARGOCD_BASE_URL  "Run ./03-argocd.sh first. It writes this into .env for you."
 need ARGOCD_TOKEN     "Run ./03-argocd.sh first. It writes this into .env for you."
 
@@ -58,7 +77,17 @@ put_secret() {
 put_secret slack-bot-token "$SLACK_BOT_TOKEN"
 put_secret slack-app-token "$SLACK_APP_TOKEN"
 put_secret argocd-token    "$ARGOCD_TOKEN"
-put_secret github-token    "$GITHUB_TOKEN"
+[[ -n "${GITHUB_TOKEN:-}"  ]] && put_secret github-token "$GITHUB_TOKEN"
+# From the file, not through $(cat): the PEM must arrive byte for byte.
+if [[ -n "${GITHUB_APP_ID:-}" ]]; then
+  if gcloud secrets describe github-app-private-key --project="$PROJECT" >/dev/null 2>&1; then
+    gcloud secrets versions add github-app-private-key --project="$PROJECT" \
+      --data-file="$GITHUB_APP_PRIVATE_KEY_FILE"
+  else
+    gcloud secrets create github-app-private-key --project="$PROJECT" \
+      --data-file="$GITHUB_APP_PRIVATE_KEY_FILE" --replication-policy=automatic --labels="$LABELS"
+  fi
+fi
 [[ -n "${JIRA_TOKEN:-}"    ]] && put_secret jira-token    "$JIRA_TOKEN"
 [[ -n "${GRAFANA_TOKEN:-}" ]] && put_secret grafana-token "$GRAFANA_TOKEN"
 
@@ -117,7 +146,8 @@ build_image .. "$AGENT_IMAGE"
 SECRETS="SLACK_BOT_TOKEN=slack-bot-token:latest"
 SECRETS+=",SLACK_APP_TOKEN=slack-app-token:latest"
 SECRETS+=",ARGOCD_TOKEN=argocd-token:latest"
-SECRETS+=",GITHUB_TOKEN=github-token:latest"
+[[ -n "${GITHUB_TOKEN:-}"  ]] && SECRETS+=",GITHUB_TOKEN=github-token:latest"
+[[ -n "${GITHUB_APP_ID:-}" ]] && SECRETS+=",GITHUB_APP_PRIVATE_KEY=github-app-private-key:latest"
 [[ -n "${JIRA_TOKEN:-}"    ]] && SECRETS+=",JIRA_TOKEN=jira-token:latest"
 [[ -n "${GRAFANA_TOKEN:-}" ]] && SECRETS+=",GRAFANA_TOKEN=grafana-token:latest"
 
@@ -128,6 +158,8 @@ SECRETS+=",GITHUB_TOKEN=github-token:latest"
 ENVVARS="ARGOCD_BASE_URL=${ARGOCD_BASE_URL}"
 ENVVARS+="|GITHUB_OWNER=${GITHUB_OWNER:-ofirc}"
 ENVVARS+="|GITHUB_REPO=${GITHUB_REPO:-hello-agent}"
+[[ -n "${GITHUB_APP_ID:-}" ]] && ENVVARS+="|GITHUB_APP_ID=${GITHUB_APP_ID}"
+[[ -n "${GITHUB_APP_INSTALLATION_ID:-}" ]] && ENVVARS+="|GITHUB_APP_INSTALLATION_ID=${GITHUB_APP_INSTALLATION_ID}"
 ENVVARS+="|GITOPS_PREFIX=01-slack-sre-chatbot/gitops/overlays"
 ENVVARS+="|ENVIRONMENTS=${ENVIRONMENTS}"
 # Vertex is required, not optional: drift debug and drift fix run the model and have no

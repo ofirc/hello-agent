@@ -273,7 +273,7 @@ elif [[ -f "$ENV_FILE" ]]; then
 else
   cp "${PROJECT_DIR}/.env.example" "$new_env"
   echo "    warning: no .env, so .env.local starts from .env.example." >&2
-  echo "    Fill in SLACK_BOT_TOKEN, SLACK_APP_TOKEN, GITHUB_TOKEN and AUTHORIZED_EMAILS in .env.local." >&2
+  echo "    Fill in SLACK_BOT_TOKEN, SLACK_APP_TOKEN, GITHUB_APP_* or GITHUB_TOKEN, and AUTHORIZED_EMAILS in .env.local." >&2
 fi
 
 # Only the Docker runner opt-in (compose.docker-sandbox.yaml, or SANDBOX=docker with

@@ -30,10 +30,16 @@ services:
       SANDBOX: shim
       SANDBOX_CLI: /usr/local/gcp/bin/sandbox
       AGENT_WORKDIR: ""
+      # .env.local holds the key's host path; the volume below puts it here. Ignored
+      # unless GITHUB_APP_ID is set, so /dev/null standing in for no key is harmless.
+      GITHUB_APP_PRIVATE_KEY_FILE: /run/secrets/github-app.pem
     # The agent runs as the image's own non-root user (65532:65532). Nothing here raises
     # that, and nothing here reaches the host's Docker.
     volumes:
       - ./deploy/local/sandbox-shim:/usr/local/gcp/bin/sandbox:ro
+      # Interpolated from .env in this directory, which compose reads on its own. Like
+      # the tokens in the environment, the shim's code can read this file.
+      - ${GITHUB_APP_PRIVATE_KEY_FILE:-/dev/null}:/run/secrets/github-app.pem:ro
     networks: [kind]
 networks:
   kind:

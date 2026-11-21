@@ -21,19 +21,28 @@ import (
 const apiBase = "https://api.github.com"
 
 type Client struct {
-	token string
+	src   TokenSource
 	owner string
 	repo  string
 	http  *http.Client
 }
 
-func New(token, owner, repo string) *Client {
-	return &Client{token: token, owner: owner, repo: repo, http: httpx.Default()}
+// New takes nil when no credential is configured, and then reports !Configured.
+func New(src TokenSource, owner, repo string) *Client {
+	return &Client{src: src, owner: owner, repo: repo, http: httpx.Default()}
 }
 
-func (c *Client) Configured() bool { return c.token != "" && c.owner != "" && c.repo != "" }
+func (c *Client) Configured() bool { return c.src != nil && c.owner != "" && c.repo != "" }
 
 func (c *Client) Slug() string { return c.owner + "/" + c.repo }
+
+// Identity is whose name the agent writes to GitHub under, "" when not configured.
+func (c *Client) Identity() string {
+	if c == nil || c.src == nil {
+		return ""
+	}
+	return c.src.Identity()
+}
 
 type File struct {
 	Path    string
@@ -171,6 +180,13 @@ func (c *Client) AddLabels(ctx context.Context, number int, labels ...string) {
 }
 
 func (c *Client) do(ctx context.Context, method, u string, payload any) ([]byte, error) {
+	if c.src == nil {
+		return nil, fmt.Errorf("github is not configured (set GITHUB_APP_ID or GITHUB_TOKEN)")
+	}
+	token, err := c.src.Token(ctx)
+	if err != nil {
+		return nil, err
+	}
 	var rdr io.Reader
 	if payload != nil {
 		b, err := json.Marshal(payload)
@@ -183,7 +199,7 @@ func (c *Client) do(ctx context.Context, method, u string, payload any) ([]byte,
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 	if payload != nil {

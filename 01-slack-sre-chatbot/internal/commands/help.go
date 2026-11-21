@@ -75,6 +75,12 @@ func runHelp(ctx context.Context, d *Deps, in *Invocation) error {
 
 func runDoctor(ctx context.Context, d *Deps, in *Invocation) error {
 	enabled := d.Cfg.Enabled()
+	// The configured credential can be a broken App with no token behind it.
+	enabled["github"] = d.GH != nil && d.GH.Configured()
+	githubWhy := "desired state and fix PRs"
+	if id := d.GH.Identity(); id != "" {
+		githubWhy += ", as " + id
+	}
 	modelOK, modelLabel, modelWhy := modelRow(d.Cfg.ModelProvider, d.Cfg.ModelName(), enabled["model"], d.Agent != nil)
 	enabled["model"] = modelOK
 	enabled["sandbox"] = d.Agent != nil && d.Agent.SandboxAvailable()
@@ -99,7 +105,7 @@ func runDoctor(ctx context.Context, d *Deps, in *Invocation) error {
 	rows := []struct {
 		key, label, why string
 	}{
-		{"github", "github", "desired state and fix PRs"},
+		{"github", "github", githubWhy},
 		{"argocd", "argocd", "actual cluster state"},
 		{"grafana", "grafana", "is the drift hurting anyone"},
 		{"jira", "jira", "has anyone already reported it"},

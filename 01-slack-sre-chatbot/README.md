@@ -33,7 +33,7 @@ Ollama model, see [Run it locally on kind](#run-it-locally-on-kind).
 ```
 User -> Slack -> [ SRE Agent (Socket Mode) ] -> Argo CD -> GKE
                         |      |     |
-                        |      |     +-> GitHub (desired state, fix PRs)
+                        |      |     +-> GitHub (desired state, fix PRs as <app>[bot])
                         |      +-------> Grafana (is anyone hurt?)
                         |              > JIRA   (has anyone complained?)
                         +-> Secret Manager + Vertex AI (a model is required for debug and fix)
@@ -53,10 +53,12 @@ machine instead, with no GCP project, see
 gcloud auth login --update-adc
 gcloud config set project <your-project-id>   # every script reads this
 
-# 1. Slack app: paste manifest.yaml at api.slack.com/apps, install it, copy both tokens
+# 1. Slack app: paste manifest.yaml at api.slack.com/apps, install it, copy both tokens.
+#    GitHub App (step 2b) and/or a fine-grained PAT, then check them
 cd 01-slack-sre-chatbot
 pbcopy < manifest.yaml
-cp .env.example .env && vim .env     # SLACK_BOT_TOKEN, SLACK_APP_TOKEN, GITHUB_TOKEN, AUTHORIZED_EMAILS
+cp .env.example .env && vim .env     # SLACK_*, GITHUB_APP_* and/or GITHUB_TOKEN, AUTHORIZED_EMAILS
+set -a && source .env && set +a && go run ./cmd/ghcheck
 
 # 2. Infrastructure, strictly in this order
 cd deploy
@@ -99,10 +101,10 @@ brew install kind kubectl ollama
 brew services start ollama
 ollama pull qwen3:14b                # up.sh turns this into sre-qwen3:14b (32K context)
 
-# 1. Slack app: same as the Quickstart. Skip if .env already has the tokens
+# 1. Slack app and GitHub: same as the Quickstart. Skip if .env already has them
 cd 01-slack-sre-chatbot
 pbcopy < manifest.yaml
-cp .env.example .env && vim .env     # SLACK_BOT_TOKEN, SLACK_APP_TOKEN, GITHUB_TOKEN, AUTHORIZED_EMAILS
+cp .env.example .env && vim .env     # SLACK_*, GITHUB_APP_* and/or GITHUB_TOKEN, AUTHORIZED_EMAILS
 
 # 2. The local stack
 ./deploy/local/up.sh                 # kind + Argo CD + images + model + .env.local. Safe to rerun
@@ -163,7 +165,7 @@ pbcopy < manifest.yaml
 
 ```bash
 cp .env.example .env
-vim .env          # SLACK_BOT_TOKEN, SLACK_APP_TOKEN, GITHUB_TOKEN, AUTHORIZED_EMAILS
+vim .env          # SLACK_BOT_TOKEN, SLACK_APP_TOKEN, AUTHORIZED_EMAILS; GitHub is step 2b
 ```
 
 **`AUTHORIZED_EMAILS` decides who may drive the agent.** `drift debug`, `drift fix`,
@@ -280,6 +282,114 @@ gcloud beta run instances restart sre-agent --project=$PROJECT --region=us-east1
 the secret, and the result is an `invalid_auth` that looks nothing like a whitespace bug.
 
 The `xapp-` token rotates separately on Basic Information: delete it, generate a new one.
+</details>
+
+---
+
+## 2b. Give the agent its own GitHub identity
+
+The agent reads the overlays from GitHub and opens the fix PRs there. It can do that as
+a **GitHub App**, or with a **fine-grained personal access token (PAT)**, or with both:
+
+| | Fix PRs and commits show | Token lifetime |
+| --- | --- | --- |
+| GitHub App | `<app-slug>[bot]` with a *bot* badge, commits *Verified* | one hour, minted on demand |
+| PAT | you | until you revoke it |
+
+With both set, the App is used and the PAT is the fallback: whenever the App cannot
+mint a token (wrong ID, bad key, not installed, a permission missing), the agent logs a
+warning, uses the PAT, and tries the App again a minute later. A PR is never split
+across the two: the choice is made before anything is written.
+
+**Create the App.** GitHub -> *Settings* -> *Developer settings* -> *GitHub Apps* ->
+**New GitHub App**:
+
+- **GitHub App name**: what reviewers see, for example `ofirc-sre-agent`. The bot user
+  becomes `<slug>[bot]`.
+- **Homepage URL**: anything, the repo URL is fine.
+- **Webhook**: untick *Active*. The agent dials out and never receives events.
+- **Repository permissions**: *Contents* read and write, *Pull requests* read and
+  write. *Metadata* read-only is added for you. Nothing else.
+- **Where can this GitHub App be installed?** *Only on this account*.
+
+Then, on the App's page:
+
+1. Note the **App ID** at the top.
+2. **Private keys** -> *Generate a private key*. A `.pem` file downloads. It is the
+   App's password: anyone holding it can act as the App on every repo it is installed on.
+3. **Install App** -> your account -> *Only select repositories* -> `hello-agent`. The
+   number at the end of the URL you land on is the **installation ID**.
+
+**Put the key outside the repo**, where neither git nor a Docker build context can
+pick it up:
+
+```bash
+mkdir -p ~/.config/sre-agent && chmod 700 ~/.config/sre-agent
+mv ~/Downloads/<app-slug>.*.private-key.pem ~/.config/sre-agent/github-app.pem
+chmod 600 ~/.config/sre-agent/github-app.pem
+```
+
+**Add to `.env`**, with the path spelled out: `.env` is read by bash, by Docker Compose
+and by `04-agent.sh`, and not all of them expand `~`.
+
+```bash
+GITHUB_APP_ID=1234567
+GITHUB_APP_INSTALLATION_ID=87654321      # optional, looked up from the repo when empty
+GITHUB_APP_PRIVATE_KEY_FILE=/Users/<you>/.config/sre-agent/github-app.pem
+GITHUB_TOKEN=github_pat_...              # optional fallback; drop it to run App-only
+```
+
+Where the key goes from there:
+
+| Where the agent runs | How it gets the key |
+| --- | --- |
+| `go run` | reads the file at `GITHUB_APP_PRIVATE_KEY_FILE` |
+| `docker compose up` | `compose.yaml` mounts that file read-only at `/run/secrets/github-app.pem` |
+| Cloud Run | `04-agent.sh` uploads the file to Secret Manager as `github-app-private-key`, and the instance gets it as `GITHUB_APP_PRIVATE_KEY`, an environment variable |
+
+On Cloud Run it is an environment variable and never a mounted file on purpose: the
+sandbox that runs the model's code sees the container's filesystem, read-only, but is
+started with no environment.
+
+**Check it before going further.** `ghcheck` runs the same client code as the agent,
+without Slack, and stops at the first thing that is wrong:
+
+```bash
+set -a && source .env && set +a
+go run ./cmd/ghcheck            # read-only
+go run ./cmd/ghcheck -write     # also creates and deletes a scratch branch
+```
+
+```
+GitHub App (GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY_FILE, GITHUB_APP_INSTALLATION_ID)
+  PASS  private key   read from /Users/you/.config/sre-agent/github-app.pem
+  PASS  app           "ofirc-sre-agent" (slug ofirc-sre-agent), owned by ofirc, https://github.com/apps/ofirc-sre-agent
+  PASS  installation  87654321
+  PASS  token         expires 12:14, granted contents=write metadata=read pull_requests=write
+  PASS  bot user      ofirc-sre-agent[bot], commits as 9876543+ofirc-sre-agent[bot]@users.noreply.github.com
+  PASS  read          01-slack-sre-chatbot/gitops/overlays/prod/kustomization.yaml
+  SKIP  write         not checked, rerun with -write to create and delete a scratch branch
+
+Personal access token (GITHUB_TOKEN)
+  PASS  user          ofirc, the name its commits and PRs carry
+  ...
+
+Result: fix PRs will be opened by ofirc-sre-agent[bot]. If the App ever fails to mint a token, the agent falls back to the token and they are opened as ofirc.
+```
+
+It exits non-zero only when neither credential works. The agent logs the same verdict at
+startup (`github identity`), and `/sre doctor` shows it on the `github` line.
+
+**Optional, recommended:** a branch ruleset on `main` that requires one approving review.
+The App's permissions would let it merge its own PR through the API; the agent never
+does, and the ruleset makes that GitHub's rule rather than the agent's promise.
+
+<details>
+<summary><b>Rotating the App's key</b></summary>
+
+Generate a second key on the App's page, replace the `.pem`, rerun `ghcheck`, then
+`./04-agent.sh` (it pushes a new secret version) and delete the old key on GitHub. The
+App allows several keys at once, so there is no gap.
 </details>
 
 ---
@@ -627,6 +737,7 @@ The reply is in step 8. Four things about it are worth pointing at during a demo
 
 ```
 cmd/agent/main.go              socket loop, ack, event fan-out
+cmd/ghcheck/                   checks the GitHub App and PAT settings without Slack
 internal/config/               env -> Config, with fail-fast token validation
 internal/slackio/              Reporter: one message that keeps updating
 internal/commands/
@@ -652,7 +763,8 @@ compose.yaml                   the agent as a container beside the kind cluster 
 compose.docker-sandbox.yaml    opt-in override: the Docker runner and the socket it needs
 internal/providers/
   httpx/                       one place for timeouts, retries, error redaction
-  argocd/  github/  gitops/    actual state, PRs, desired state
+  argocd/  github/  gitops/    actual state, PRs, desired state; github/ also mints the
+                               App's installation tokens and falls back to the PAT
   grafana/ jira/               symptoms and reports
 ```
 
@@ -758,8 +870,10 @@ and see the result.
   ollama pull qwen3:14b
   ```
 
-- A `.env` in this directory with `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN` and `GITHUB_TOKEN`
-  (step 2). Nothing else in it is needed.
+- A `.env` in this directory with `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN` (step 2) and the
+  GitHub App settings, `GITHUB_TOKEN`, or both (step 2b). Nothing else in it is needed.
+  On Linux, the container's user (uid 65532) must be able to read the `.pem`; Docker
+  Desktop on a Mac reads a `chmod 600` file as is.
 - `gitops/overlays-local/` on the `main` branch of the GitHub repo. Argo CD inside kind
   renders the overlays from GitHub, not from your disk, so until that folder is merged
   the three applications show `ComparisonError`.
@@ -856,7 +970,8 @@ starts it in the run's evidence folder, but neither is a boundary:
 
 - **In the container** (`docker compose up`), code running as the agent's user can read
   the agent's environment from `/proc/<pid>/environ`. That environment holds the Slack,
-  GitHub and Argo CD tokens, which locally are the same real credentials the cloud uses.
+  GitHub and Argo CD tokens, which locally are the same real credentials the cloud uses,
+  and it can read the GitHub App key mounted at `/run/secrets/github-app.pem`.
 - **With `go run` on your Mac** it is wider still: the code runs as *you*. It can read
   anything you can, including your home directory, `~/.kube/config`, your cloud CLI
   credentials and this directory's `.env.local`, and it can write to them.
@@ -864,8 +979,10 @@ starts it in the run's evidence folder, but neither is a boundary:
 A prompt injection that gets the model to write a few lines of Python could send any of
 that anywhere. The injection surface is small locally (JIRA is off, and Argo CD messages
 come from your own kind cluster), so the shim is a reasonable default for working on the
-agent. But use a separate, narrowly scoped GitHub token for local runs (fine-grained,
-this one repository, contents and pull requests only), prefer the container over
+agent. But keep the GitHub credentials narrow: an App installed on this one repository
+only, or a fine-grained token for this one repository with contents and pull requests
+only. The App key is the bigger secret of the two, since it mints tokens for every repo
+the App is installed on, and the installation is what bounds it. Prefer the container over
 `go run` when you are not changing code, and switch to the Docker runner when you want
 isolation.
 
@@ -1026,7 +1143,18 @@ Cloud Build, creates the Cloud Run instance with `--sandbox-launcher` and 1Gi of
 and waits until the agent logs a Slack connection. It sets `VERTEX_PROJECT` for you, since
 `drift debug` and `drift fix` cannot run without it.
 
-Run `/sre doctor` afterwards. `model`, `sandbox` and `skills` should all be green.
+For GitHub it needs `GITHUB_APP_ID` or `GITHUB_TOKEN`, and uploads whichever are set:
+the file at `GITHUB_APP_PRIVATE_KEY_FILE` becomes the secret `github-app-private-key`,
+the token becomes `github-token`. Remove one from `.env` and the next run stops passing
+it to the instance; the secret itself stays in Secret Manager until you delete it.
+
+Run `/sre doctor` afterwards. `model`, `sandbox` and `skills` should all be green, and
+the `github` line names the identity in use. Confirm it in the startup log too:
+
+```bash
+gcloud logging read 'resource.type="cloud_run_instance" AND jsonPayload.msg="github identity"' \
+  --project=$PROJECT --limit=1 --freshness=10m --format='value(jsonPayload.as)'
+```
 
 ```bash
 gcloud beta run instances describe sre-agent --project=$PROJECT --region=us-east1
@@ -1093,7 +1221,7 @@ In any channel in `harness-engineering.slack.com`:
 
 ```
 Integrations
-✅ github   - desired state and fix PRs
+✅ github   - desired state and fix PRs, as GitHub App ofirc-sre-agent[bot], falling back to the personal access token
 ✅ argocd   - actual cluster state
 ✅ grafana  - is the drift hurting anyone
 ❌ jira     - has anyone already reported it
@@ -1250,7 +1378,9 @@ confirmed by @ofir | the agent does not merge, that stays with a human
 
 Anyone else who clicks gets `Only @ofir can confirm this proposal.` and the proposal stays
 pending. The PR title and body are the model's, with a footer saying it was
-model-proposed and confirmed by you. After 30 minutes, or after a restart, the buttons
+model-proposed and confirmed by you. With the GitHub App, the PR, its branch and its
+commit are authored by `<app-slug>[bot]` and the commit is *Verified*; with only the PAT
+they carry your name. After 30 minutes, or after a restart, the buttons
 answer `That proposal expired or was already used`, and re-running `drift fix` is the
 way forward.
 
@@ -1291,6 +1421,11 @@ their output.
 | `drift debug`, `drift fix` or `doctor` says "nobody is authorized yet" | `AUTHORIZED_EMAILS` is empty, so the gate refuses everyone. Set it in `.env` and rerun `./04-agent.sh` (cloud) or `./deploy/local/up.sh` (local) |
 | "You are not authorized to use ..." for your own account | the email on your Slack profile is not in `AUTHORIZED_EMAILS`. Check the address Slack has (profile, then *Contact information*) |
 | "I could not verify your Slack email" | `users.info` failed, your profile has no email, or the account is a bot, deactivated, or from another organization in a shared channel. A missing `users:read.email` scope shows up here: reinstall the app after manifest changes, and the next attempt picks it up |
+| Fix PRs opened under your name although the App is configured | the App failed and the agent fell back to `GITHUB_TOKEN`. The log has `falling back to the personal access token` with the reason, and `/sre doctor` says `because GitHub App ... failed`. Run `go run ./cmd/ghcheck` locally to see which step fails |
+| `ghcheck`: `app` fails with 404 `Integration not found` | `GITHUB_APP_ID` is not an App's ID. It is the number at the top of the App's settings page, not the client ID |
+| `ghcheck`: `app` fails with 401 | the `.pem` belongs to a different App, or the key was deleted on GitHub, or this machine's clock is more than a minute off |
+| `ghcheck`: `installation` says the App is not installed | install it on the repo (step 2b), or `GITHUB_APP_INSTALLATION_ID` points at another installation |
+| `ghcheck`: `token` fails with 422 | the installation does not cover `GITHUB_REPO`, or lacks *Contents* or *Pull requests* write. After changing the App's permissions, accept them on the installation page: GitHub does not apply them until you do |
 | `./04-agent.sh` says ARGOCD_TOKEN missing | you skipped `./03-argocd.sh`, which mints it and writes it to `.env` |
 | `./04-agent.sh` says ARGOCD_BASE_URL points at localhost | `.env` holds a port-forward address from local testing. Rerun `./03-argocd.sh` |
 | `/sre doctor` shows argocd unconfigured | `ARGOCD_BASE_URL` or `ARGOCD_TOKEN` unset. The agent boots anyway on purpose, so it can tell you rather than crash-loop |
